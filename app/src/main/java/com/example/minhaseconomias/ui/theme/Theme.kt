@@ -12,32 +12,52 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
 
 private val DarkColorScheme = darkColorScheme(
-    primary = Purple80,
-    secondary = PurpleGrey80,
-    tertiary = Pink80
+    primary = GreenPrimaryDark,
+    onPrimary = GreenOnPrimaryDark,
+    primaryContainer = GreenPrimaryContainerDark,
+    onPrimaryContainer = GreenOnPrimaryContainerDark,
+    secondary = GreenSecondaryDark,
+    onSecondary = GreenOnSecondaryDark,
+    secondaryContainer = GreenSecondaryContainerDark,
+    onSecondaryContainer = GreenOnSecondaryContainerDark,
+    tertiary = GreenTertiaryDark,
+    onTertiary = GreenOnTertiaryDark,
+    tertiaryContainer = GreenTertiaryContainerDark,
+    onTertiaryContainer = GreenOnTertiaryContainerDark,
+    error = GreenErrorDark,
+    onError = GreenOnErrorDark,
+    background = GreenBackgroundDark,
+    onBackground = GreenOnBackgroundDark,
+    surface = GreenSurfaceDark,
+    onSurface = GreenOnSurfaceDark
 )
 
 private val LightColorScheme = lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40
-
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+    primary = GreenPrimaryLight,
+    onPrimary = GreenOnPrimaryLight,
+    primaryContainer = GreenPrimaryContainerLight,
+    onPrimaryContainer = GreenOnPrimaryContainerLight,
+    secondary = GreenSecondaryLight,
+    onSecondary = GreenOnSecondaryLight,
+    secondaryContainer = GreenSecondaryContainerLight,
+    onSecondaryContainer = GreenOnSecondaryContainerLight,
+    tertiary = GreenTertiaryLight,
+    onTertiary = GreenOnTertiaryLight,
+    tertiaryContainer = GreenTertiaryContainerLight,
+    onTertiaryContainer = GreenOnTertiaryContainerLight,
+    error = GreenErrorLight,
+    onError = GreenOnErrorLight,
+    background = GreenBackgroundLight,
+    onBackground = GreenOnBackgroundLight,
+    surface = GreenSurfaceLight,
+    onSurface = GreenOnSurfaceLight
 )
 
 @Composable
 fun MinhaseconomiasTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
+    dynamicColor: Boolean = false, // Desativado para forçar nosso tema verde
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
@@ -45,7 +65,6 @@ fun MinhaseconomiasTheme(
             val context = LocalContext.current
             if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         }
-
         darkTheme -> DarkColorScheme
         else -> LightColorScheme
     }
