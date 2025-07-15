@@ -45,6 +45,12 @@ import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.*
 import com.example.minhaseconomias.ui.theme.MinhaseconomiasTheme
+import kotlinx.coroutines.flow.map
+
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 
 
 // --- Modelos de Dados, Repositório, ViewModel, Factory e ApiService (permanecem iguais) ---
@@ -54,8 +60,15 @@ data class MovimentacoesResponse(@SerializedName("movimentacoes") val movimentac
 data class ContaSaldo(@SerializedName("nome") val nome: String, @SerializedName("saldo_atual") val saldoAtual: Double)
 data class SaldosResponse(@SerializedName("saldoGeral") val saldoGeral: Double, @SerializedName("saldosContas") val saldosContas: List<ContaSaldo>)
 
-class MovimentacaoRepository(private val dao: MovimentacaoDao, private val api: ApiService) {
+class MovimentacaoRepository(
+    private val dao: MovimentacaoDao,
+    private val api: ApiService,
+    private val categoriaDao: CategoriaDao, // NOVO
+    private val contaDao: ContaDao         // NOVO
+) {
     val todasMovimentacoes: Flow<List<Movimentacao>> = dao.getAll()
+    val todasCategorias: Flow<List<CategoriaSugerida>> = categoriaDao.getAll()
+    val todasContas: Flow<List<ContaSugerida>> = contaDao.getAll()
 
     suspend fun addOrUpdateMovimentacao(mov: Movimentacao) {
         // A lógica de adicionar/atualizar localmente está correta.
@@ -71,51 +84,56 @@ class MovimentacaoRepository(private val dao: MovimentacaoDao, private val api: 
         }
     }
 
-    // A MUDANÇA PRINCIPAL ESTÁ AQUI
     suspend fun syncWithServer() {
-        Log.d("Repository", "Iniciando sincronização inteligente...")
+        Log.d("Repository", "Iniciando sincronização...")
 
-        // 1. Pega todas as alterações locais que ainda não foram para o servidor.
-        val localUnsyncedChanges = dao.getUnsynced()
-        val localDeletedItems = dao.getDeleted()
-
-        // 2. Tenta enviar as alterações locais para o servidor (como antes).
-        if (localUnsyncedChanges.isNotEmpty()) {
-            Log.d("Repository", "Enviando ${localUnsyncedChanges.size} transações não sincronizadas.")
-            localUnsyncedChanges.forEach { mov ->
+        // 1. Envia todas as alterações locais (criações, edições) para o servidor.
+        // Esta parte continua a mesma.
+        val unsynced = dao.getUnsynced()
+        if (unsynced.isNotEmpty()) {
+            Log.d("Repository", "Enviando ${unsynced.size} transações não sincronizadas.")
+            unsynced.forEach { mov ->
                 try {
                     val response = if (mov.serverId != null) {
                         api.updateMovimentacao(mov.serverId!!, mov.dataOcorrencia, mov.descricao, mov.valor.toString(), mov.categoria, mov.conta)
                     } else {
                         api.addMovimentacao(mov.dataOcorrencia, mov.descricao, mov.valor.toString(), mov.categoria, mov.conta)
                     }
-                    // Não fazemos nada com a resposta por enquanto, a lógica abaixo cuidará do estado.
-                    if(response.isSuccessful || response.code() == 302) {
-                         Log.d("Repository", "Sucesso no envio do item local: ${mov.localId}")
+                    if (response.isSuccessful || response.code() == 302) {
+                        Log.d("Repository", "Sucesso no envio do item local: ${mov.localId}")
                     }
-                } catch (e: Exception) { Log.e("Repository", "Falha ao enviar transação local ${mov.localId}", e) }
+                } catch (e: Exception) {
+                    Log.e("Repository", "Falha ao enviar transação local ${mov.localId}", e)
+                }
             }
         }
 
-        if (localDeletedItems.isNotEmpty()) {
-            Log.d("Repository", "Enviando ${localDeletedItems.size} exclusões.")
-            localDeletedItems.forEach { mov ->
+        // 2. Envia todas as exclusões para o servidor.
+        // Esta parte também continua a mesma.
+        val toDelete = dao.getDeleted()
+        if (toDelete.isNotEmpty()) {
+            Log.d("Repository", "Enviando ${toDelete.size} exclusões.")
+            toDelete.forEach { mov ->
                 try {
                     val response = api.deleteMovimentacao(mov.serverId!!)
                     if (response.isSuccessful) {
                         dao.deleteByLocalId(mov.localId)
                         Log.d("Repository", "Transação ${mov.serverId} excluída com sucesso.")
                     }
-                } catch (e: Exception) { Log.e("Repository", "Falha ao excluir transação ${mov.serverId}", e) }
+                } catch (e: Exception) {
+                    Log.e("Repository", "Falha ao excluir transação ${mov.serverId}", e)
+                }
             }
         }
 
-        // 3. Busca a lista de verdade do servidor.
+        // 3. Busca a lista completa e autoritativa do servidor e substitui TUDO.
+        // ESTA É A PARTE CORRIGIDA.
         try {
             val serverResponse = api.getMovimentacoes(null)
             if (serverResponse.isSuccessful) {
                 val serverMovs = serverResponse.body()?.movimentacoes ?: emptyList()
-                Log.d("Repository", "Recebidas ${serverMovs.size} transações do servidor.")
+                Log.d("Repository", "Recebidas ${serverMovs.size} transações do servidor. Substituindo dados locais.")
+
                 val freshLocalMovs = serverMovs.map {
                     Movimentacao(
                         serverId = it.id,
@@ -124,30 +142,27 @@ class MovimentacaoRepository(private val dao: MovimentacaoDao, private val api: 
                         valor = it.valor,
                         categoria = it.categoria,
                         conta = it.conta,
-                        isSynced = true // Itens do servidor estão sempre sincronizados
+                        isSynced = true // Itens do servidor estão, por definição, sincronizados.
                     )
                 }
 
-                // 4. Lógica de "Merge" Inteligente:
-                // Pega as alterações locais novamente, caso algo tenha mudado durante a chamada de rede.
-                val finalUnsyncedChanges = dao.getUnsynced()
-                val serverIdsFromUnsynced = finalUnsyncedChanges.mapNotNull { it.serverId }.toSet()
-
-                // Filtra a lista do servidor, removendo qualquer item que tenha uma versão local não sincronizada.
-                // Isso dá prioridade à alteração local que ainda não foi confirmada.
-                val filteredServerMovs = freshLocalMovs.filterNot { it.serverId in serverIdsFromUnsynced }
-
-                // Apaga tudo...
+                // Apaga completamente o banco de dados local...
                 dao.deleteAll()
-                // ...insere a lista limpa do servidor...
-                dao.insertAll(filteredServerMovs)
-                // ...e re-insere as alterações locais por cima, garantindo que elas não sejam perdidas.
-                dao.insertAll(finalUnsyncedChanges)
+                // ... e insere a nova lista vinda do servidor.
+                dao.insertAll(freshLocalMovs)
 
-                Log.d("Repository", "Banco de dados local sincronizado de forma inteligente.")
+                // A lógica de merge de sugestões continua a mesma.
+                if (serverMovs.isNotEmpty()) {
+                    val categoriasUnicas = serverMovs.map { it.categoria }.distinct().filter { it.isNotBlank() }
+                    val contasUnicas = serverMovs.map { it.conta }.distinct().filter { it.isNotBlank() }
+                    categoriaDao.insertAll(categoriasUnicas.map { CategoriaSugerida(nome = it) })
+                    contaDao.insertAll(contasUnicas.map { ContaSugerida(nome = it) })
+                }
+
+                Log.d("Repository", "Sincronização destrutiva concluída com sucesso.")
             }
         } catch (e: Exception) {
-            Log.e("Repository", "Falha ao buscar e fazer merge das transações do servidor.", e)
+            Log.e("Repository", "Falha ao buscar e substituir as transações do servidor.", e)
         }
     }
 }
@@ -159,8 +174,18 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
     private val _saldosData = mutableStateOf<SaldosResponse?>(null)
     val saldosData: State<SaldosResponse?> = _saldosData
 
+    // --- NOVOS STATEFLOWS PARA SUGESTÕES ---
+    val categoriasSugeridas: StateFlow<List<String>> = repository.todasCategorias
+        .map { list -> list.map { it.nome } } // Converte List<CategoriaSugerida> para List<String>
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val contasSugeridas: StateFlow<List<String>> = repository.todasContas
+        .map { list -> list.map { it.nome } } // Converte List<ContaSugerida> para List<String>
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    // --- FIM DOS NOVOS STATEFLOWS ---
+
     init {
-        sync()
+        // sync()
     }
 
     fun addOrUpdateMovimentacao(mov: Movimentacao) = viewModelScope.launch {
@@ -222,7 +247,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         val database = AppDatabase.getInstance(this)
-        val repository = MovimentacaoRepository(database.movimentacaoDao(), ApiClient.instance)
+        val repository = MovimentacaoRepository(
+            database.movimentacaoDao(),
+            ApiClient.instance,
+            database.categoriaDao(), // NOVO
+            database.contaDao()      // NOVO
+        )
         viewModelFactory = MovimentacaoViewModelFactory(repository)
 
         setContent {
@@ -248,6 +278,18 @@ fun MainScreen(viewModel: MovimentacaoViewModel) {
     var showTransactionSheet by remember { mutableStateOf(false) }
     var transactionToEdit by remember { mutableStateOf<Movimentacao?>(null) }
 
+    // --- INÍCIO DA NOVA LÓGICA DE SINCRONIZAÇÃO ---
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            // Este código será executado toda vez que o app ficar visível (estado STARTED)
+            // e será cancelado automaticamente quando o app for para o fundo (estado STOPPED).
+            Log.d("MainScreen", "App em primeiro plano, iniciando sincronização...")
+            viewModel.sync()
+        }
+    }
+    // --- FIM DA NOVA LÓGICA ---
+    
     Scaffold(
         topBar = {
             TopAppBar(
@@ -306,9 +348,10 @@ fun MainScreen(viewModel: MovimentacaoViewModel) {
             TransactionSheetContent(
                 viewModel = viewModel,
                 movimentacaoToEdit = transactionToEdit,
+                // Agora, onSuccess apenas fecha a tela. A UI se atualizará
+                // a partir do banco local, e a sincronização acontecerá depois.
                 onSuccess = {
                     showTransactionSheet = false
-                    viewModel.sync()
                 }
             )
         }
@@ -609,6 +652,7 @@ fun TransactionItem(mov: Movimentacao, onEditClick: (Movimentacao) -> Unit, onDe
     }
 }
 
+// Em MainActivity.kt, substitua a função TransactionSheetContent
 @Composable
 fun TransactionSheetContent(viewModel: MovimentacaoViewModel, movimentacaoToEdit: Movimentacao?, onSuccess: () -> Unit) {
     var descricao by remember { mutableStateOf(movimentacaoToEdit?.descricao ?: "") }
@@ -619,6 +663,11 @@ fun TransactionSheetContent(viewModel: MovimentacaoViewModel, movimentacaoToEdit
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     val isEditMode = movimentacaoToEdit != null
+
+    // --- COLETANDO AS SUGESTÕES DO VIEWMODEL ---
+    val categoriasSugeridas by viewModel.categoriasSugeridas.collectAsState()
+    val contasSugeridas by viewModel.contasSugeridas.collectAsState()
+
     Column(
         modifier = Modifier
             .padding(16.dp)
@@ -652,19 +701,23 @@ fun TransactionSheetContent(viewModel: MovimentacaoViewModel, movimentacaoToEdit
             Text("Receita", modifier = Modifier.padding(start = 4.dp))
         }
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
+
+        // --- SUBSTITUINDO OS CAMPOS DE TEXTO ANTIGOS ---
+        AutoCompleteTextField(
             value = categoria,
             onValueChange = { categoria = it },
-            label = { Text("Categoria") },
-            modifier = Modifier.fillMaxWidth()
+            label = "Categoria",
+            suggestions = categoriasSugeridas
         )
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
+        AutoCompleteTextField(
             value = conta,
             onValueChange = { conta = it },
-            label = { Text("Conta") },
-            modifier = Modifier.fillMaxWidth()
+            label = "Conta",
+            suggestions = contasSugeridas
         )
+        // --- FIM DA SUBSTITUIÇÃO ---
+
         Spacer(Modifier.height(24.dp))
         if (errorMessage != null) {
             Text(
@@ -675,6 +728,7 @@ fun TransactionSheetContent(viewModel: MovimentacaoViewModel, movimentacaoToEdit
         }
         Button(
             onClick = {
+                // A lógica do botão de salvar permanece a mesma...
                 isLoading = true
                 errorMessage = null
                 val valorNumerico = valor.replace(",", ".").toDoubleOrNull()
@@ -723,4 +777,49 @@ sealed class Screen(
 ) {
     object Dashboard : Screen("dashboard", "Dashboard", Icons.Filled.Dashboard)
     object Transactions : Screen("transactions", "Transações", Icons.Filled.SwapHoriz)
+}
+
+@Composable
+fun AutoCompleteTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    suggestions: List<String>,
+    modifier: Modifier = Modifier
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val filteredSuggestions = remember(value, suggestions) {
+        if (value.isBlank()) {
+            suggestions
+        } else {
+            suggestions.filter { it.contains(value, ignoreCase = true) }
+        }
+    }
+
+    Box(modifier = modifier) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = {
+                onValueChange(it)
+                expanded = true
+            },
+            label = { Text(label) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        DropdownMenu(
+            expanded = expanded && filteredSuggestions.isNotEmpty(),
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            filteredSuggestions.forEach { suggestion ->
+                DropdownMenuItem(
+                    text = { Text(suggestion) },
+                    onClick = {
+                        onValueChange(suggestion)
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
 }

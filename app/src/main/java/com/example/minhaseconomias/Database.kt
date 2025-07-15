@@ -43,10 +43,42 @@ interface MovimentacaoDao {
     suspend fun deleteAll()
 }
 
+// Adicione estas duas data classes no arquivo Database.kt
+@Entity(tableName = "categorias_sugeridas")
+data class CategoriaSugerida(
+    @PrimaryKey val nome: String
+)
+
+@Entity(tableName = "contas_sugeridas")
+data class ContaSugerida(
+    @PrimaryKey val nome: String
+)
+
+// Adicione estas duas interfaces de DAO no arquivo Database.kt
+@Dao
+interface CategoriaDao {
+    @Query("SELECT * FROM categorias_sugeridas ORDER BY nome")
+    fun getAll(): Flow<List<CategoriaSugerida>>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(categorias: List<CategoriaSugerida>)
+}
+
+@Dao
+interface ContaDao {
+    @Query("SELECT * FROM contas_sugeridas ORDER BY nome")
+    fun getAll(): Flow<List<ContaSugerida>>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(contas: List<ContaSugerida>)
+}
+
 // --- 3. DEFINIÇÃO DO BANCO DE DADOS ---
-@Database(entities = [Movimentacao::class], version = 4, exportSchema = false)
+@Database(entities = [Movimentacao::class, CategoriaSugerida::class, ContaSugerida::class], version = 5, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun movimentacaoDao(): MovimentacaoDao
+    abstract fun categoriaDao(): CategoriaDao
+    abstract fun contaDao(): ContaDao
 
     companion object {
         @Volatile
