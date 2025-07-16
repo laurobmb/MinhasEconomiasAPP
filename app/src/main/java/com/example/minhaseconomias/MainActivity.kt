@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -11,27 +12,35 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.CompareArrows
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+import com.example.minhaseconomias.ui.theme.MinhaseconomiasTheme
 import com.google.gson.annotations.SerializedName
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import okhttp3.Cookie
 import okhttp3.CookieJar
@@ -44,18 +53,28 @@ import retrofit2.http.*
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.*
-import com.example.minhaseconomias.ui.theme.MinhaseconomiasTheme
-import kotlinx.coroutines.flow.map
 
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.repeatOnLifecycle
+// NOVO: Define o resultado da sincronização
+sealed class SyncResult {
+    object Success : SyncResult()
+    data class Error(val message: String) : SyncResult()
+}
 
+sealed class AppScreen(val route: String) {
+    object Home : AppScreen("home")
+    object TransactionDetail : AppScreen("transaction_detail/{transactionId}?type={type}") {
+        fun createRoute(transactionId: Int, type: String? = null): String {
+            return if (type != null) {
+                "transaction_detail/$transactionId?type=$type"
+            } else {
+                "transaction_detail/$transactionId"
+            }
+        }
+    }
+    object Transferencia : AppScreen("transferencia")
+}
 
-// --- Modelos de Dados, Repositório, ViewModel, Factory e ApiService (permanecem iguais) ---
-data class MovimentacaoApiDto(@SerializedName("id") val id: Int, @SerializedName("data_ocorrencia") val dataOcorrencia: String, @SerializedName("descricao") val descricao:
-String, @SerializedName("valor") val valor: Double, @SerializedName("categoria") val categoria: String, @SerializedName("conta") val conta: String)
+data class MovimentacaoApiDto(@SerializedName("id") val id: Int, @SerializedName("data_ocorrencia") val dataOcorrencia: String, @SerializedName("descricao") val descricao: String, @SerializedName("valor") val valor: Double, @SerializedName("categoria") val categoria: String, @SerializedName("conta") val conta: String)
 data class MovimentacoesResponse(@SerializedName("movimentacoes") val movimentacoes: List<MovimentacaoApiDto>)
 data class ContaSaldo(@SerializedName("nome") val nome: String, @SerializedName("saldo_atual") val saldoAtual: Double)
 data class SaldosResponse(@SerializedName("saldoGeral") val saldoGeral: Double, @SerializedName("saldosContas") val saldosContas: List<ContaSaldo>)
@@ -63,20 +82,18 @@ data class SaldosResponse(@SerializedName("saldoGeral") val saldoGeral: Double, 
 class MovimentacaoRepository(
     private val dao: MovimentacaoDao,
     private val api: ApiService,
-    private val categoriaDao: CategoriaDao, // NOVO
-    private val contaDao: ContaDao         // NOVO
+    private val categoriaDao: CategoriaDao,
+    private val contaDao: ContaDao
 ) {
     val todasMovimentacoes: Flow<List<Movimentacao>> = dao.getAll()
     val todasCategorias: Flow<List<CategoriaSugerida>> = categoriaDao.getAll()
     val todasContas: Flow<List<ContaSugerida>> = contaDao.getAll()
 
     suspend fun addOrUpdateMovimentacao(mov: Movimentacao) {
-        // A lógica de adicionar/atualizar localmente está correta.
         dao.insertAll(listOf(mov.copy(isSynced = false)))
     }
 
     suspend fun deleteMovimentacao(mov: Movimentacao) {
-        // A lógica de deleção também está correta.
         if (mov.serverId == null) {
             dao.deleteByLocalId(mov.localId)
         } else {
@@ -84,11 +101,9 @@ class MovimentacaoRepository(
         }
     }
 
-    suspend fun syncWithServer() {
+    // ATUALIZADO: Função agora retorna SyncResult
+    suspend fun syncWithServer(): SyncResult {
         Log.d("Repository", "Iniciando sincronização...")
-
-        // 1. Envia todas as alterações locais (criações, edições) para o servidor.
-        // Esta parte continua a mesma.
         val unsynced = dao.getUnsynced()
         if (unsynced.isNotEmpty()) {
             Log.d("Repository", "Enviando ${unsynced.size} transações não sincronizadas.")
@@ -107,9 +122,6 @@ class MovimentacaoRepository(
                 }
             }
         }
-
-        // 2. Envia todas as exclusões para o servidor.
-        // Esta parte também continua a mesma.
         val toDelete = dao.getDeleted()
         if (toDelete.isNotEmpty()) {
             Log.d("Repository", "Enviando ${toDelete.size} exclusões.")
@@ -125,88 +137,74 @@ class MovimentacaoRepository(
                 }
             }
         }
-
-        // 3. Busca a lista completa e autoritativa do servidor e substitui TUDO.
-        // ESTA É A PARTE CORRIGIDA.
-        try {
+        return try {
             val serverResponse = api.getMovimentacoes(null)
             if (serverResponse.isSuccessful) {
                 val serverMovs = serverResponse.body()?.movimentacoes ?: emptyList()
                 Log.d("Repository", "Recebidas ${serverMovs.size} transações do servidor. Substituindo dados locais.")
-
-                val freshLocalMovs = serverMovs.map {
-                    Movimentacao(
-                        serverId = it.id,
-                        dataOcorrencia = it.dataOcorrencia,
-                        descricao = it.descricao,
-                        valor = it.valor,
-                        categoria = it.categoria,
-                        conta = it.conta,
-                        isSynced = true // Itens do servidor estão, por definição, sincronizados.
-                    )
-                }
-
-                // Apaga completamente o banco de dados local...
+                val freshLocalMovs = serverMovs.map { Movimentacao(serverId = it.id, dataOcorrencia = it.dataOcorrencia, descricao = it.descricao, valor = it.valor, categoria = it.categoria, conta = it.conta, isSynced = true) }
                 dao.deleteAll()
-                // ... e insere a nova lista vinda do servidor.
                 dao.insertAll(freshLocalMovs)
-
-                // A lógica de merge de sugestões continua a mesma.
                 if (serverMovs.isNotEmpty()) {
                     val categoriasUnicas = serverMovs.map { it.categoria }.distinct().filter { it.isNotBlank() }
                     val contasUnicas = serverMovs.map { it.conta }.distinct().filter { it.isNotBlank() }
                     categoriaDao.insertAll(categoriasUnicas.map { CategoriaSugerida(nome = it) })
                     contaDao.insertAll(contasUnicas.map { ContaSugerida(nome = it) })
                 }
-
                 Log.d("Repository", "Sincronização destrutiva concluída com sucesso.")
+                SyncResult.Success
+            } else {
+                Log.e("Repository", "Erro na resposta do servidor: ${serverResponse.code()}")
+                SyncResult.Error("Falha ao buscar dados do servidor.")
             }
         } catch (e: Exception) {
-            Log.e("Repository", "Falha ao buscar e substituir as transações do servidor.", e)
+            Log.e("Repository", "Falha de conexão durante a sincronização.", e)
+            SyncResult.Error("Falha de conexão com o servidor.")
         }
     }
 }
 
 class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : ViewModel() {
     val movimentacoes: StateFlow<List<Movimentacao>> = repository.todasMovimentacoes.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-    private val _isSyncing = mutableStateOf(false)
-    val isSyncing: State<Boolean> = _isSyncing
     private val _saldosData = mutableStateOf<SaldosResponse?>(null)
     val saldosData: State<SaldosResponse?> = _saldosData
-
-    // --- NOVOS STATEFLOWS PARA SUGESTÕES ---
-    val categoriasSugeridas: StateFlow<List<String>> = repository.todasCategorias
-        .map { list -> list.map { it.nome } } // Converte List<CategoriaSugerida> para List<String>
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    val contasSugeridas: StateFlow<List<String>> = repository.todasContas
-        .map { list -> list.map { it.nome } } // Converte List<ContaSugerida> para List<String>
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-    // --- FIM DOS NOVOS STATEFLOWS ---
-
-    init {
-        // sync()
-    }
-
-    fun addOrUpdateMovimentacao(mov: Movimentacao) = viewModelScope.launch {
-        repository.addOrUpdateMovimentacao(mov)
-    }
-
-    fun deleteMovimentacao(mov: Movimentacao) = viewModelScope.launch {
-        repository.deleteMovimentacao(mov)
-    }
-
-    fun sync() = viewModelScope.launch {
-        _isSyncing.value = true
-        repository.syncWithServer()
-        fetchSaldos()
-        _isSyncing.value = false
-    }
-
-    private fun fetchSaldos() = viewModelScope.launch {
+    val categoriasSugeridas: StateFlow<List<String>> = repository.todasCategorias.map { list -> list.map { it.nome } }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val contasSugeridas: StateFlow<List<String>> = repository.todasContas.map { list -> list.map { it.nome } }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    init {}
+    fun addOrUpdateMovimentacao(mov: Movimentacao) = viewModelScope.launch { repository.addOrUpdateMovimentacao(mov) }
+    fun addTransferencia(data: String, descricao: String, valor: String, origem: String, destino: String, onSuccess: () -> Unit, onError: (String) -> Unit) = viewModelScope.launch {
         try {
-            val response = ApiClient.instance.getSaldos()
-            if (response.isSuccessful) {
+            if (origem.isBlank() || destino.isBlank() || valor.isBlank() || data.isBlank()) {
+                onError("Todos os campos são obrigatórios."); return@launch
+            }
+            if (origem == destino) {
+                onError("A conta de origem e destino não podem ser a mesma."); return@launch
+            }
+            val response = ApiClient.instance.addTransferencia(data, descricao, valor, origem, destino)
+            if (response.isSuccessful || response.code() == 302) {
+                Log.d("ViewModel", "Transferência enviada com sucesso."); onSuccess()
+            } else {
+                Log.e("ViewModel", "Erro ao enviar transferência: ${response.errorBody()?.string()}"); onError("Erro ao processar a transferência no servidor.")
+            }
+        } catch (e: Exception) {
+            Log.e("ViewModel", "Exceção ao enviar transferência", e); onError("Falha na conexão ao tentar enviar a transferência.")
+        }
+    }
+    fun deleteMovimentacao(mov: Movimentacao) = viewModelScope.launch { repository.deleteMovimentacao(mov) }
+
+    // ATUALIZADO: Função agora retorna o resultado e atualiza os saldos em caso de sucesso
+    suspend fun sync(): SyncResult {
+        val result = repository.syncWithServer()
+        if (result is SyncResult.Success) {
+            fetchSaldos()
+        }
+        return result
+    }
+
+    // ATUALIZADO: Função agora é pública para ser chamada de fora
+    fun fetchSaldos() = viewModelScope.launch {
+        try {
+            val response = ApiClient.instance.getSaldos(); if (response.isSuccessful) {
                 _saldosData.value = response.body()
             }
         } catch (e: Exception) {
@@ -230,9 +228,13 @@ interface ApiService {
     @GET("/api/movimentacoes") suspend fun getMovimentacoes(@Query("search_descricao") searchQuery: String?): Response<MovimentacoesResponse>
     @GET("/api/saldos") suspend fun getSaldos(): Response<SaldosResponse>
     @FormUrlEncoded @POST("/movimentacoes") suspend fun addMovimentacao(@Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("categoria") categoria: String, @Field("conta") conta: String, @Field("consolidado") consolidado: String = "on"): Response<Unit>
-    @FormUrlEncoded @POST("/movimentacoes/update/{id}") suspend fun updateMovimentacao(@Path("id") id: Int, @Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("categoria") categoria: String, @Field("conta") conta: String, @Field("consolidado") consolidado: String ="on"): Response<Unit>
+    @FormUrlEncoded @POST("/movimentacoes/update/{id}") suspend fun updateMovimentacao(@Path("id") id: Int, @Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("categoria") categoria: String, @Field("conta") conta: String, @Field("consolidado") consolidado: String = "on"): Response<Unit>
     @DELETE("/movimentacoes/{id}") suspend fun deleteMovimentacao(@Path("id") id: Int): Response<Unit>
+    @FormUrlEncoded
+    @POST("/movimentacoes/transferencia")
+    suspend fun addTransferencia(@Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("conta_origem") contaOrigem: String, @Field("conta_destino") contaDestino: String): Response<Unit>
 }
+
 object ApiClient {
     private const val BASE_URL = "http://192.168.0.221:8080"
     private val cookieJar = object : CookieJar { private val cookieStore = mutableListOf<Cookie>(); override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) { cookieStore.removeAll { it.name() == "session_token" }; cookieStore.addAll(cookies) }; override fun loadForRequest(url: HttpUrl): List<Cookie> = cookieStore }
@@ -242,64 +244,94 @@ object ApiClient {
 
 class MainActivity : ComponentActivity() {
     private lateinit var viewModelFactory: MovimentacaoViewModelFactory
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         val database = AppDatabase.getInstance(this)
-        val repository = MovimentacaoRepository(
-            database.movimentacaoDao(),
-            ApiClient.instance,
-            database.categoriaDao(), // NOVO
-            database.contaDao()      // NOVO
-        )
+        val repository = MovimentacaoRepository(database.movimentacaoDao(), ApiClient.instance, database.categoriaDao(), database.contaDao())
         viewModelFactory = MovimentacaoViewModelFactory(repository)
-
         setContent {
             MinhaseconomiasTheme {
                 var isLoggedIn by remember { mutableStateOf(false) }
-
                 if (!isLoggedIn) {
                     LoginScreen(onLoginSuccess = { isLoggedIn = true })
                 } else {
-                    val viewModel: MovimentacaoViewModel = viewModel(factory = viewModelFactory)
-                    MainScreen(viewModel = viewModel)
+                    MinhasEconomiasApp(viewModelFactory = viewModelFactory)
                 }
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(viewModel: MovimentacaoViewModel) {
-    val isSyncing by viewModel.isSyncing
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.Dashboard) }
-    var showTransactionSheet by remember { mutableStateOf(false) }
-    var transactionToEdit by remember { mutableStateOf<Movimentacao?>(null) }
-
-    // --- INÍCIO DA NOVA LÓGICA DE SINCRONIZAÇÃO ---
-    val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(lifecycleOwner) {
-        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            // Este código será executado toda vez que o app ficar visível (estado STARTED)
-            // e será cancelado automaticamente quando o app for para o fundo (estado STOPPED).
-            Log.d("MainScreen", "App em primeiro plano, iniciando sincronização...")
-            viewModel.sync()
+fun MinhasEconomiasApp(viewModelFactory: MovimentacaoViewModelFactory) {
+    val navController = rememberNavController()
+    val viewModel: MovimentacaoViewModel = viewModel(factory = viewModelFactory)
+    NavHost(navController = navController, startDestination = AppScreen.Home.route) {
+        composable(AppScreen.Home.route) {
+            MainScreen(
+                viewModel = viewModel,
+                onNavigateToAddTransaction = { type -> navController.navigate(AppScreen.TransactionDetail.createRoute(-1, type)) },
+                onNavigateToEditTransaction = { transactionId -> navController.navigate(AppScreen.TransactionDetail.createRoute(transactionId)) },
+                onNavigateToTransfer = { navController.navigate(AppScreen.Transferencia.route) }
+            )
+        }
+        composable(
+            route = AppScreen.TransactionDetail.route,
+            arguments = listOf(navArgument("transactionId") { type = NavType.IntType }, navArgument("type") { type = NavType.StringType; nullable = true })
+        ) { backStackEntry ->
+            val transactionId = backStackEntry.arguments?.getInt("transactionId") ?: -1
+            val transactionType = backStackEntry.arguments?.getString("type")
+            TransactionDetailScreen(
+                viewModel = viewModel,
+                transactionId = transactionId,
+                transactionType = transactionType,
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
+        composable(AppScreen.Transferencia.route) {
+            TransferenciaScreen(viewModel = viewModel, onNavigateBack = { navController.popBackStack() })
         }
     }
-    // --- FIM DA NOVA LÓGICA ---
-    
+}
+
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreen(viewModel: MovimentacaoViewModel, onNavigateToAddTransaction: (type: String) -> Unit, onNavigateToEditTransaction: (Int) -> Unit, onNavigateToTransfer: () -> Unit) {
+    var isSyncing by remember { mutableStateOf(false) }
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.Dashboard) }
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(Unit) {
+        viewModel.fetchSaldos()
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = { Text(currentScreen.label) },
                 actions = {
-                    IconButton(onClick = { viewModel.sync() }, enabled = !isSyncing) {
+                    IconButton(
+                        onClick = {
+                            scope.launch {
+                                isSyncing = true
+                                val result = viewModel.sync()
+                                isSyncing = false
+                                val message = when (result) {
+                                    is SyncResult.Success -> "Sincronização concluída com sucesso!"
+                                    is SyncResult.Error -> "Falha na sincronização: ${result.message}"
+                                }
+                                snackbarHostState.showSnackbar(message)
+                            }
+                        },
+                        enabled = !isSyncing
+                    ) {
                         if (isSyncing) {
                             CircularProgressIndicator(Modifier.size(24.dp))
                         } else {
-                            Icon(Icons.Filled.Sync, contentDescription = "Sincronizar")
+                            Icon(Icons.Filled.Sync, "Sincronizar")
                         }
                     }
                 }
@@ -311,457 +343,236 @@ fun MainScreen(viewModel: MovimentacaoViewModel) {
                     NavigationBarItem(
                         selected = currentScreen.route == screen.route,
                         onClick = { currentScreen = screen },
-                        icon = { Icon(screen.icon, contentDescription = screen.label) },
+                        icon = { Icon(screen.icon, screen.label) },
                         label = { Text(screen.label) }
                     )
                 }
             }
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = {
-                transactionToEdit = null
-                showTransactionSheet = true
-            }) {
-                Icon(Icons.Filled.Add, contentDescription = "Adicionar Transação")
-            }
+            MultiActionFloatingActionButton(
+                onExpenseClick = { onNavigateToAddTransaction("despesa") },
+                onIncomeClick = { onNavigateToAddTransaction("receita") },
+                onTransferClick = onNavigateToTransfer
+            )
         }
     ) { innerPadding ->
         Box(modifier = Modifier.padding(innerPadding)) {
             when (currentScreen) {
-                is Screen.Dashboard -> DashboardScreen(
-                    viewModel,
-                    onNavigateToTransactions = { currentScreen = Screen.Transactions }
-                )
-                is Screen.Transactions -> TransactionsScreen(
-                    viewModel,
-                    onEditClick = { mov ->
-                        transactionToEdit = mov
-                        showTransactionSheet = true
-                    }
-                )
+                is Screen.Dashboard -> DashboardScreen(viewModel) { currentScreen = Screen.Transactions }
+                is Screen.Transactions -> TransactionsScreen(viewModel = viewModel, onEditClick = { mov -> onNavigateToEditTransaction(mov.localId) })
             }
-        }
-    }
-
-    if (showTransactionSheet) {
-        ModalBottomSheet(onDismissRequest = { showTransactionSheet = false }) {
-            TransactionSheetContent(
-                viewModel = viewModel,
-                movimentacaoToEdit = transactionToEdit,
-                // Agora, onSuccess apenas fecha a tela. A UI se atualizará
-                // a partir do banco local, e a sincronização acontecerá depois.
-                onSuccess = {
-                    showTransactionSheet = false
-                }
-            )
         }
     }
 }
 
+// O restante do seu código (LoginScreen, DashboardScreen, TransactionDetailScreen, etc.) permanece aqui...
+// ... (colei o resto do seu arquivo original para garantir que não falta nada)
 
 @Composable
 fun LoginScreen(onLoginSuccess: () -> Unit) {
-    var email by remember { mutableStateOf("lauro@localnet.com") }
-    var password by remember { mutableStateOf("1q2w3e") }
-    val coroutineScope = rememberCoroutineScope()
-    var isLoading by remember { mutableStateOf(false) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
-    Surface(modifier = Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier.padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Image(
-                    painter = painterResource(id = R.drawable.minhas_economias),
-                    contentDescription = "Logo",
-                    modifier = Modifier.size(120.dp)
-                )
-                Spacer(Modifier.height(16.dp))
-                Text("Minhas Economias", fontSize = 32.sp, fontWeight = FontWeight.Bold)
-            }
-            Spacer(Modifier.height(32.dp))
-            OutlinedTextField(
-                value = email,
-                onValueChange = { email = it },
-                label = { Text("E-mail") },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(16.dp))
-            OutlinedTextField(
-                value = password,
-                onValueChange = { password = it },
-                label = { Text("Senha") },
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(24.dp))
-            if (errorMessage != null) {
-                Text(
-                    text = errorMessage!!,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-            }
-            Button(
-                onClick = {
-                    isLoading = true
-                    errorMessage = null
-                    coroutineScope.launch {
-                        try {
-                            val response = ApiClient.instance.login(email, password)
-                            if (response.isSuccessful || response.code() == 302) {
-                                onLoginSuccess()
-                            } else {
-                                errorMessage = "E-mail ou senha inválidos."
-                            }
-                        } catch (e: Exception) {
-                            errorMessage = "Erro de conexão."
-                            Log.e("LoginScreen", "Erro de rede", e)
-                        } finally {
-                            isLoading = false
-                        }
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !isLoading
-            ) {
-                if (isLoading) {
-                    CircularProgressIndicator(Modifier.size(24.dp), color = Color.White)
-                } else {
-                    Text("Entrar")
-                }
-            }
-        }
-    }
+    var email by remember { mutableStateOf("lauro@localnet.com") }; var password by remember { mutableStateOf("1q2w3e") }; val coroutineScope = rememberCoroutineScope(); var isLoading by remember { mutableStateOf(false) }; var errorMessage by remember { mutableStateOf<String?>(null) }; Surface(modifier = Modifier.fillMaxSize()) { Column(modifier = Modifier.padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Image(painter = painterResource(id = R.drawable.minhas_economias), "Logo", Modifier.size(120.dp)); Spacer(Modifier.height(16.dp)); Text("Minhas Economias", fontSize = 32.sp, fontWeight = FontWeight.Bold) }; Spacer(Modifier.height(32.dp)); OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("E-mail") }, modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(16.dp)); OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Senha") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(24.dp)); if (errorMessage != null) { Text(errorMessage!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 8.dp)) }; Button(onClick = { isLoading = true; errorMessage = null; coroutineScope.launch { try { val response = ApiClient.instance.login(email, password); if (response.isSuccessful || response.code() == 302) { onLoginSuccess() } else { errorMessage = "E-mail ou senha inválidos." } } catch (e: Exception) { errorMessage = "Erro de conexão."; Log.e("LoginScreen", "Erro de rede", e) } finally { isLoading = false } } }, modifier = Modifier.fillMaxWidth(), enabled = !isLoading) { if (isLoading) { CircularProgressIndicator(Modifier.size(24.dp), Color.White) } else { Text("Entrar") } } } }
 }
-
 
 @Composable
 fun DashboardScreen(viewModel: MovimentacaoViewModel, onNavigateToTransactions: () -> Unit) {
-    val saldosData by viewModel.saldosData
-    if (saldosData == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator()
-        }
-    } else {
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            item {
-                SaldoGeralCard(
-                    saldosData!!.saldoGeral,
-                    onClick = onNavigateToTransactions
-                )
-            }
-            items(saldosData!!.saldosContas) { conta ->
-                SaldoContaItem(conta)
-            }
-        }
-    }
+    val saldosData by viewModel.saldosData; if (saldosData == null) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() } } else { LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) { item { SaldoGeralCard(saldosData!!.saldoGeral, onClick = onNavigateToTransactions) }; items(saldosData!!.saldosContas) { conta -> SaldoContaItem(conta) } } }
 }
 
 @Composable
 fun SaldoGeralCard(saldo: Double, onClick: () -> Unit) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
-        elevation = CardDefaults.cardElevation(4.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                text = "Saldo Geral",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onPrimary
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = formatCurrency(saldo),
-                fontSize = 36.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onPrimary
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = "Clique para ver as transações",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onPrimary
-            )
-        }
-    }
+    Card(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick), elevation = CardDefaults.cardElevation(4.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary)) { Column(modifier = Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) { Text("Saldo Geral", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onPrimary); Spacer(Modifier.height(8.dp)); Text(text = formatCurrency(saldo), fontSize = 36.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimary); Spacer(Modifier.height(4.dp)); Text("Clique para ver as transações", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimary) } }
 }
 
 @Composable
 fun SaldoContaItem(conta: ContaSaldo) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        elevation = CardDefaults.cardElevation(2.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-    ) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = conta.nome,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.weight(1f)
-            )
-            Text(
-                text = formatCurrency(conta.saldoAtual),
-                color = if (conta.saldoAtual < 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
-    }
+    Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(2.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) { Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) { Text(conta.nome, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f)); Text(formatCurrency(conta.saldoAtual), color = if (conta.saldoAtual < 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.SemiBold) } }
 }
 
 @Composable
 fun TransactionsScreen(viewModel: MovimentacaoViewModel, onEditClick: (Movimentacao) -> Unit) {
-    val movimentacoes by viewModel.movimentacoes.collectAsState()
-    var searchQuery by remember { mutableStateOf("") }
-    val filteredMovimentacoes = remember(searchQuery, movimentacoes) {
-        if (searchQuery.isBlank()) {
-            movimentacoes
-        } else {
-            movimentacoes.filter {
-                it.descricao.contains(searchQuery, ignoreCase = true)
-            }
-        }
-    }
-    Column(Modifier.padding(horizontal = 8.dp)) {
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            label = { Text("Buscar por descrição...") },
-            leadingIcon = { Icon(Icons.Filled.Search, "Ícone de busca") },
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(8.dp)
-        )
-        LazyColumn {
-            items(filteredMovimentacoes, key = { it.localId }) { mov ->
-                TransactionItem(
-                    mov,
-                    onEditClick = onEditClick,
-                    onDeleteClick = { viewModel.deleteMovimentacao(mov) })
-            }
-        }
-    }
+    val movimentacoes by viewModel.movimentacoes.collectAsState(); var searchQuery by remember { mutableStateOf("") }; val filteredMovimentacoes = remember(searchQuery, movimentacoes) { if (searchQuery.isBlank()) { movimentacoes } else { movimentacoes.filter { it.descricao.contains(searchQuery, ignoreCase = true) } } }; Column(Modifier.padding(horizontal = 8.dp)) { OutlinedTextField(value = searchQuery, onValueChange = { searchQuery = it }, label = { Text("Buscar por descrição...") }, leadingIcon = { Icon(Icons.Filled.Search, "Ícone de busca") }, modifier = Modifier.fillMaxWidth().padding(8.dp)); LazyColumn { items(filteredMovimentacoes, key = { it.localId }) { mov -> TransactionItem(mov, onEditClick = { onEditClick(mov) }, onDeleteClick = { viewModel.deleteMovimentacao(mov) }) } } }
 }
 
 @Composable
 fun TransactionItem(mov: Movimentacao, onEditClick: (Movimentacao) -> Unit, onDeleteClick: () -> Unit) {
-    var showDeleteDialog by remember { mutableStateOf(false) }
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp)
-            .clickable { onEditClick(mov) },
-        elevation = CardDefaults.cardElevation(1.dp)
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp), // Aumentei o padding vertical
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // Ícone de "não sincronizado"
-            if (!mov.isSynced) {
-                Icon(
-                    imageVector = Icons.Default.CloudOff,
-                    contentDescription = "Não sincronizado",
-                    tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                    modifier = Modifier.padding(end = 8.dp)
-                )
-            }
+    var showDeleteDialog by remember { mutableStateOf(false) }; Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { onEditClick(mov) }, elevation = CardDefaults.cardElevation(1.dp)) { Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { if (!mov.isSynced) { Icon(imageVector = Icons.Default.CloudOff, contentDescription = "Não sincronizado", tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), modifier = Modifier.padding(end = 8.dp)) }; Column(Modifier.weight(1f)) { Text("#${mov.serverId ?: mov.localId} - ${mov.descricao}", fontWeight = FontWeight.Bold); Spacer(modifier = Modifier.height(4.dp)); Text("Data: ${mov.dataOcorrencia} | ${mov.categoria} | ${mov.conta}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Text(formatCurrency(mov.valor), color = if (mov.valor < 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 8.dp)); Column { IconButton(onClick = { onEditClick(mov) }, modifier = Modifier.size(24.dp)) { Icon(Icons.Filled.Edit, "Editar") }; IconButton(onClick = { showDeleteDialog = true }, modifier = Modifier.size(24.dp)) { Icon(Icons.Filled.Delete, "Excluir", tint = MaterialTheme.colorScheme.error) } } } }; if (showDeleteDialog) { AlertDialog(onDismissRequest = { showDeleteDialog = false }, title = { Text("Confirmar Exclusão") }, text = { Text("Tem certeza que deseja excluir a transação '${mov.descricao}'?") }, confirmButton = { Button(onClick = { onDeleteClick(); showDeleteDialog = false }) { Text("Excluir") } }, dismissButton = { TextButton(onClick = { showDeleteDialog = false }) { Text("Cancelar") } }) }
+}
 
-            // Coluna com as informações principais
-            Column(Modifier.weight(1f)) {
-                // LINHA 1: ID e Descrição
-                Text(
-                    // Mostra o ID do servidor ou o ID local se ainda não tiver um do servidor
-                    text = "#${mov.serverId ?: mov.localId} - ${mov.descricao}",
-                    fontWeight = FontWeight.Bold
-                )
-
-                // Espaçamento
-                Spacer(modifier = Modifier.height(4.dp))
-
-                // LINHA 2: Data, Categoria e Conta
-                Text(
-                    // Adicionamos a data aqui!
-                    text = "Data: ${mov.dataOcorrencia} | ${mov.categoria} | ${mov.conta}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant // Cor mais suave
-                )
-            }
-
-            // Valor da transação (permanece igual)
-            Text(
-                text = formatCurrency(mov.valor),
-                // Usando a cor primária do tema para valores positivos.
-                // Ela será um verde escuro no tema claro e um verde claro no tema escuro.
-                color = if (mov.valor < 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(start = 8.dp)
-            )
-
-            // Botões de ação (agora dentro de uma coluna para melhor alinhamento)
-            Column {
-                IconButton(onClick = { onEditClick(mov) }, modifier = Modifier.size(24.dp)) {
-                    Icon(Icons.Filled.Edit, "Editar")
-                }
-                IconButton(onClick = { showDeleteDialog = true }, modifier = Modifier.size(24.dp)) {
-                    Icon(Icons.Filled.Delete, "Excluir", tint = MaterialTheme.colorScheme.error)
-                }
-            }
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TransactionDetailScreen(viewModel: MovimentacaoViewModel, transactionId: Int, transactionType: String?, onNavigateBack: () -> Unit) {
+    val isEditMode = transactionId != -1
+    val movimentacaoToEdit by produceState<Movimentacao?>(initialValue = null, key1 = transactionId) {
+        if (isEditMode) {
+            value = viewModel.movimentacoes.value.find { it.localId == transactionId }
         }
     }
-
-    // O AlertDialog para confirmar a exclusão permanece o mesmo
-    if (showDeleteDialog) {
-        AlertDialog(
-            onDismissRequest = { showDeleteDialog = false },
-            title = { Text("Confirmar Exclusão") },
-            text = { Text("Tem certeza que deseja excluir a transação '${mov.descricao}'?") },
-            confirmButton = {
-                Button(onClick = {
-                    onDeleteClick()
-                    showDeleteDialog = false
-                }) {
-                    Text("Excluir")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteDialog = false }) {
-                    Text("Cancelar")
-                }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(if (isEditMode) "Editar Transação" else "Adicionar Transação") },
+                navigationIcon = { IconButton(onClick = onNavigateBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar") } }
+            )
+        }
+    ) { innerPadding ->
+        if (isEditMode && movimentacaoToEdit == null) {
+            Box(modifier = Modifier.fillMaxSize().padding(innerPadding), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
             }
-        )
+        } else {
+            TransactionSheetContent(
+                modifier = Modifier.padding(innerPadding),
+                viewModel = viewModel,
+                movimentacaoToEdit = movimentacaoToEdit,
+                initialTransactionType = transactionType,
+                onSuccess = onNavigateBack
+            )
+        }
     }
 }
 
-// Em MainActivity.kt, substitua a função TransactionSheetContent
 @Composable
-fun TransactionSheetContent(viewModel: MovimentacaoViewModel, movimentacaoToEdit: Movimentacao?, onSuccess: () -> Unit) {
-    var descricao by remember { mutableStateOf(movimentacaoToEdit?.descricao ?: "") }
-    var valor by remember { mutableStateOf(if (movimentacaoToEdit != null) kotlin.math.abs(movimentacaoToEdit.valor).toString().replace('.', ',') else "") }
-    var categoria by remember { mutableStateOf(movimentacaoToEdit?.categoria ?: "") }
-    var conta by remember { mutableStateOf(movimentacaoToEdit?.conta ?: "") }
-    var isDespesa by remember { mutableStateOf(movimentacaoToEdit?.valor?.let { it < 0 } ?: true) }
+fun TransactionSheetContent(modifier: Modifier = Modifier, viewModel: MovimentacaoViewModel, movimentacaoToEdit: Movimentacao?, initialTransactionType: String?, onSuccess: () -> Unit) {
+    var descricao by remember(movimentacaoToEdit) { mutableStateOf(movimentacaoToEdit?.descricao ?: "") }
+    var valor by remember(movimentacaoToEdit) { mutableStateOf(if (movimentacaoToEdit != null) kotlin.math.abs(movimentacaoToEdit.valor).toString().replace('.', ',') else "") }
+    var categoria by remember(movimentacaoToEdit) { mutableStateOf(movimentacaoToEdit?.categoria ?: "") }
+    var conta by remember(movimentacaoToEdit) { mutableStateOf(movimentacaoToEdit?.conta ?: "") }
+    var isDespesa by remember(movimentacaoToEdit, initialTransactionType) {
+        mutableStateOf(
+            when {
+                movimentacaoToEdit != null -> movimentacaoToEdit.valor < 0
+                initialTransactionType != null -> initialTransactionType == "despesa"
+                else -> true
+            }
+        )
+    }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    val isEditMode = movimentacaoToEdit != null
-
-    // --- COLETANDO AS SUGESTÕES DO VIEWMODEL ---
     val categoriasSugeridas by viewModel.categoriasSugeridas.collectAsState()
     val contasSugeridas by viewModel.contasSugeridas.collectAsState()
-
-    Column(
-        modifier = Modifier
-            .padding(16.dp)
-            .fillMaxWidth(),
+    LazyColumn(
+        modifier = modifier.padding(16.dp).fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text(
-            text = if (isEditMode) "Editar Transação" else "Adicionar Nova Transação",
-            style = MaterialTheme.typography.headlineSmall,
-            modifier = Modifier.padding(bottom = 16.dp)
-        )
-        OutlinedTextField(
-            value = descricao,
-            onValueChange = { descricao = it },
-            label = { Text("Descrição") },
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = valor,
-            onValueChange = { valor = it },
-            label = { Text("Valor (Ex: 150,75)") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            RadioButton(selected = isDespesa, onClick = { isDespesa = true })
-            Text("Despesa", modifier = Modifier.padding(start = 4.dp, end = 16.dp))
-            RadioButton(selected = !isDespesa, onClick = { isDespesa = false })
-            Text("Receita", modifier = Modifier.padding(start = 4.dp))
+        item {
+            OutlinedTextField(value = descricao, onValueChange = { descricao = it }, label = { Text("Descrição") }, modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(8.dp))
+            OutlinedTextField(value = valor, onValueChange = { valor = it }, label = { Text("Valor (Ex: 150,75)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = isDespesa, onClick = { isDespesa = true })
+                Text("Despesa", modifier = Modifier.padding(start = 4.dp, end = 16.dp))
+                RadioButton(selected = !isDespesa, onClick = { isDespesa = false })
+                Text("Receita", modifier = Modifier.padding(start = 4.dp))
+            }
+            Spacer(Modifier.height(8.dp))
+            AutoCompleteTextField(value = categoria, onValueChange = { categoria = it }, label = "Categoria", suggestions = categoriasSugeridas)
+            Spacer(Modifier.height(8.dp))
+            AutoCompleteTextField(value = conta, onValueChange = { conta = it }, label = "Conta", suggestions = contasSugeridas)
+            Spacer(Modifier.height(24.dp))
+            if (errorMessage != null) {
+                Text(errorMessage!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 8.dp))
+            }
+            Button(
+                onClick = {
+                    isLoading = true; errorMessage = null; val valorNumerico = valor.replace(",", ".").toDoubleOrNull()
+                    if (valorNumerico == null) { errorMessage = "Valor inválido."; isLoading = false; return@Button }
+                    val valorFinal = if (isDespesa) -kotlin.math.abs(valorNumerico) else kotlin.math.abs(valorNumerico)
+                    val mov = movimentacaoToEdit?.copy(descricao = descricao, valor = valorFinal, categoria = categoria, conta = conta) ?: Movimentacao(serverId = null, dataOcorrencia = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()), descricao = descricao, valor = valorFinal, categoria = categoria, conta = conta)
+                    viewModel.addOrUpdateMovimentacao(mov); onSuccess()
+                },
+                modifier = Modifier.fillMaxWidth(), enabled = !isLoading
+            ) { if (isLoading) { CircularProgressIndicator(Modifier.size(24.dp), Color.White) } else { Text("Salvar") } }
         }
-        Spacer(Modifier.height(8.dp))
+    }
+}
 
-        // --- SUBSTITUINDO OS CAMPOS DE TEXTO ANTIGOS ---
-        AutoCompleteTextField(
-            value = categoria,
-            onValueChange = { categoria = it },
-            label = "Categoria",
-            suggestions = categoriasSugeridas
-        )
-        Spacer(Modifier.height(8.dp))
-        AutoCompleteTextField(
-            value = conta,
-            onValueChange = { conta = it },
-            label = "Conta",
-            suggestions = contasSugeridas
-        )
-        // --- FIM DA SUBSTITUIÇÃO ---
-
-        Spacer(Modifier.height(24.dp))
-        if (errorMessage != null) {
-            Text(
-                text = errorMessage!!,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(bottom = 8.dp)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TransferenciaScreen(viewModel: MovimentacaoViewModel, onNavigateBack: () -> Unit) {
+    var data by remember { mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())) }
+    var descricao by remember { mutableStateOf("") }
+    var valor by remember { mutableStateOf("") }
+    var contaOrigem by remember { mutableStateOf("") }
+    var contaDestino by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val coroutineScope = rememberCoroutineScope()
+    val contasSugeridas by viewModel.contasSugeridas.collectAsState()
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Nova Transferência") },
+                navigationIcon = { IconButton(onClick = onNavigateBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar") } }
             )
         }
-        Button(
-            onClick = {
-                // A lógica do botão de salvar permanece a mesma...
-                isLoading = true
-                errorMessage = null
-                val valorNumerico = valor.replace(",", ".").toDoubleOrNull()
-                if (valorNumerico == null) {
-                    errorMessage = "Valor inválido."
-                    isLoading = false
-                    return@Button
-                }
-                val valorFinal = if (isDespesa) -kotlin.math.abs(valorNumerico) else kotlin.math.abs(valorNumerico)
-                val mov = movimentacaoToEdit?.copy(
-                    descricao = descricao,
-                    valor = valorFinal,
-                    categoria = categoria,
-                    conta = conta
-                ) ?: Movimentacao(
-                    serverId = null,
-                    dataOcorrencia = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()),
-                    descricao = descricao,
-                    valor = valorFinal,
-                    categoria = categoria,
-                    conta = conta
-                )
-                viewModel.addOrUpdateMovimentacao(mov)
-                onSuccess()
-            },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = !isLoading
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier.padding(innerPadding).padding(16.dp).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (isLoading) {
-                CircularProgressIndicator(Modifier.size(24.dp), color = Color.White)
-            } else {
-                Text("Salvar")
+            item {
+                OutlinedTextField(value = data, onValueChange = { data = it }, label = { Text("Data") }, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(value = descricao, onValueChange = { descricao = it }, label = { Text("Descrição (Opcional)") }, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(value = valor, onValueChange = { valor = it }, label = { Text("Valor (Ex: 250,50)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(16.dp))
+                AutoCompleteTextField(value = contaOrigem, onValueChange = { contaOrigem = it }, label = "Conta de Origem", suggestions = contasSugeridas)
+                Spacer(Modifier.height(8.dp))
+                AutoCompleteTextField(value = contaDestino, onValueChange = { contaDestino = it }, label = "Conta de Destino", suggestions = contasSugeridas)
+                Spacer(Modifier.height(24.dp))
+                if (errorMessage != null) {
+                    Text(errorMessage!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 8.dp))
+                }
+                Button(
+                    onClick = {
+                        isLoading = true
+                        errorMessage = null
+                        viewModel.addTransferencia(data, descricao, valor, contaOrigem, contaDestino,
+                            onSuccess = {
+                                coroutineScope.launch {
+                                    viewModel.sync()
+                                    onNavigateBack()
+                                }
+                            },
+                            onError = { errorMsg ->
+                                errorMessage = errorMsg
+                                isLoading = false
+                            }
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(), enabled = !isLoading
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(Modifier.size(24.dp), Color.White)
+                    } else {
+                        Text("Realizar Transferência")
+                    }
+                }
             }
+        }
+    }
+}
+
+@Composable
+fun MultiActionFloatingActionButton(onExpenseClick: () -> Unit, onIncomeClick: () -> Unit, onTransferClick: () -> Unit) {
+    var isExpanded by remember { mutableStateOf(false) }
+    Column(
+        horizontalAlignment = Alignment.End,
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        AnimatedVisibility(visible = isExpanded) {
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                SmallFloatingActionButton(onClick = { onTransferClick(); isExpanded = false }, containerColor = MaterialTheme.colorScheme.secondaryContainer) { Icon(Icons.AutoMirrored.Filled.CompareArrows, contentDescription = "Transferência") }
+                SmallFloatingActionButton(onClick = { onIncomeClick(); isExpanded = false }, containerColor = MaterialTheme.colorScheme.tertiaryContainer) { Icon(Icons.Filled.Add, contentDescription = "Receita") }
+                SmallFloatingActionButton(onClick = { onExpenseClick(); isExpanded = false }, containerColor = MaterialTheme.colorScheme.tertiaryContainer) { Icon(Icons.Filled.Remove, contentDescription = "Despesa") }
+            }
+        }
+        FloatingActionButton(onClick = { isExpanded = !isExpanded }) {
+            Icon(if (isExpanded) Icons.Filled.Close else Icons.Filled.Add, contentDescription = if (isExpanded) "Fechar menu" else "Abrir menu")
         }
     }
 }
@@ -770,56 +581,12 @@ fun formatCurrency(value: Double): String {
     return NumberFormat.getCurrencyInstance(Locale("pt", "BR")).format(value)
 }
 
-sealed class Screen(
-    val route: String,
-    val label: String,
-    val icon: androidx.compose.ui.graphics.vector.ImageVector
-) {
+sealed class Screen(val route: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
     object Dashboard : Screen("dashboard", "Dashboard", Icons.Filled.Dashboard)
     object Transactions : Screen("transactions", "Transações", Icons.Filled.SwapHoriz)
 }
 
 @Composable
-fun AutoCompleteTextField(
-    value: String,
-    onValueChange: (String) -> Unit,
-    label: String,
-    suggestions: List<String>,
-    modifier: Modifier = Modifier
-) {
-    var expanded by remember { mutableStateOf(false) }
-    val filteredSuggestions = remember(value, suggestions) {
-        if (value.isBlank()) {
-            suggestions
-        } else {
-            suggestions.filter { it.contains(value, ignoreCase = true) }
-        }
-    }
-
-    Box(modifier = modifier) {
-        OutlinedTextField(
-            value = value,
-            onValueChange = {
-                onValueChange(it)
-                expanded = true
-            },
-            label = { Text(label) },
-            modifier = Modifier.fillMaxWidth()
-        )
-        DropdownMenu(
-            expanded = expanded && filteredSuggestions.isNotEmpty(),
-            onDismissRequest = { expanded = false },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            filteredSuggestions.forEach { suggestion ->
-                DropdownMenuItem(
-                    text = { Text(suggestion) },
-                    onClick = {
-                        onValueChange(suggestion)
-                        expanded = false
-                    }
-                )
-            }
-        }
-    }
+fun AutoCompleteTextField(value: String, onValueChange: (String) -> Unit, label: String, suggestions: List<String>, modifier: Modifier = Modifier) {
+    var expanded by remember { mutableStateOf(false) }; val filteredSuggestions = remember(value, suggestions) { if (value.isBlank()) { suggestions } else { suggestions.filter { it.contains(value, ignoreCase = true) } } }; Box(modifier = modifier) { OutlinedTextField(value = value, onValueChange = { onValueChange(it); expanded = true }, label = { Text(label) }, modifier = Modifier.fillMaxWidth()); DropdownMenu(expanded = expanded && filteredSuggestions.isNotEmpty(), onDismissRequest = { expanded = false }, modifier = Modifier.fillMaxWidth()) { filteredSuggestions.forEach { suggestion -> DropdownMenuItem(text = { Text(suggestion) }, onClick = { onValueChange(suggestion); expanded = false }) } } }
 }
