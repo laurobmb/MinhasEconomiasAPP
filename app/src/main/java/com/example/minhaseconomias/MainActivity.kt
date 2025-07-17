@@ -91,6 +91,12 @@ class MovimentacaoRepository(
         dao.insertAll(listOf(mov.copy(isSynced = false)))
     }
 
+    // NOVA FUNÇÃO para lidar com a transferência de forma atômica no banco local
+    suspend fun addTransferenciaLocal(debito: Movimentacao, credito: Movimentacao) {
+        // isSynced = false é importante para a lógica de sincronização futura
+        dao.insertAll(listOf(debito.copy(isSynced = false), credito.copy(isSynced = false)))
+    }
+
     suspend fun deleteMovimentacao(mov: Movimentacao) {
         if (mov.serverId == null) {
             dao.deleteByLocalId(mov.localId)
@@ -165,7 +171,6 @@ class MovimentacaoRepository(
         }
     }
 }
-//endregion
 
 class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : ViewModel() {
     val movimentacoes: Flow<List<Movimentacao>> = repository.todasMovimentacoes
@@ -213,11 +218,11 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
             matchesDesc && matchesStartDate && matchesEndDate && matchesCategory && matchesAccount
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-    
+
     init {
         setDefaultDateFilters()
     }
-    
+
     private fun setDefaultDateFilters() {
         val calendar = Calendar.getInstance()
         val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
@@ -245,25 +250,54 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
 
 
     fun addOrUpdateMovimentacao(mov: Movimentacao) = viewModelScope.launch { repository.addOrUpdateMovimentacao(mov) }
-    fun addTransferencia(data: String, descricao: String, valor: String, origem: String, destino: String, onSuccess: () -> Unit, onError: (String) -> Unit) = viewModelScope.launch {
-        try {
-            if (origem.isBlank() || destino.isBlank() || valor.isBlank() || data.isBlank()) {
-                onError("Todos os campos são obrigatórios."); return@launch
-            }
-            if (origem == destino) {
-                onError("A conta de origem e destino não podem ser a mesma."); return@launch
-            }
-            val tempApiService = ApiClient.create(ServerUrlManager.getUrl())
-            val response = tempApiService.addTransferencia(data, descricao, valor, origem, destino)
-            if (response.isSuccessful || response.code() == 302) {
-                Log.d("ViewModel", "Transferência enviada com sucesso."); onSuccess()
-            } else {
-                Log.e("ViewModel", "Erro ao enviar transferência: ${response.errorBody()?.string()}"); onError("Erro ao processar a transferência no servidor.")
-            }
-        } catch (e: Exception) {
-            Log.e("ViewModel", "Exceção ao enviar transferência", e); onError("Falha na conexão ao tentar enviar a transferência.")
+
+    // LÓGICA DE TRANSFERÊNCIA ATUALIZADA PARA SER OFFLINE-FIRST
+    fun addTransferencia(data: String, descricao: String, valorStr: String, origem: String, destino: String, onSuccess: () -> Unit, onError: (String) -> Unit) = viewModelScope.launch {
+        // 1. Validação dos dados de entrada
+        if (origem.isBlank() || destino.isBlank() || valorStr.isBlank() || data.isBlank()) {
+            onError("Todos os campos são obrigatórios.")
+            return@launch
         }
+        if (origem == destino) {
+            onError("A conta de origem e destino não podem ser a mesma.")
+            return@launch
+        }
+        val valorNumerico = valorStr.replace(",", ".").toDoubleOrNull()
+        if (valorNumerico == null || valorNumerico <= 0) {
+            onError("O valor da transferência deve ser um número positivo.")
+            return@launch
+        }
+
+        // 2. Cria as duas movimentações (débito e crédito)
+        val valorAbsoluto = kotlin.math.abs(valorNumerico)
+
+        val descricaoDebito = if (descricao.isNotBlank()) "Transferência para $destino: $descricao" else "Transferência para $destino"
+        val debito = Movimentacao(
+            serverId = null,
+            dataOcorrencia = data,
+            descricao = descricaoDebito,
+            valor = -valorAbsoluto,
+            categoria = "Transferência",
+            conta = origem
+        )
+
+        val descricaoCredito = if (descricao.isNotBlank()) "Transferência de $origem: $descricao" else "Transferência de $origem"
+        val credito = Movimentacao(
+            serverId = null,
+            dataOcorrencia = data,
+            descricao = descricaoCredito,
+            valor = valorAbsoluto,
+            categoria = "Transferência",
+            conta = destino
+        )
+
+        // 3. Salva ambas as movimentações no repositório local
+        repository.addTransferenciaLocal(debito, credito)
+
+        // 4. Notifica a UI do sucesso imediato
+        onSuccess()
     }
+
     fun deleteMovimentacao(mov: Movimentacao) = viewModelScope.launch { repository.deleteMovimentacao(mov) }
 
     suspend fun sync(): SyncResult {
@@ -286,7 +320,7 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
     }
 }
 
-//region Outras Classes e Componíveis (Sem Alterações)
+
 class MovimentacaoViewModelFactory(private val repository: MovimentacaoRepository) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(MovimentacaoViewModel::class.java)) {
@@ -868,8 +902,11 @@ fun TransferenciaScreen(viewModel: MovimentacaoViewModel, onNavigateBack: () -> 
     var contaDestino by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    val coroutineScope = rememberCoroutineScope()
     val contasSugeridas by viewModel.contasSugeridas.collectAsState()
+
+    // Lógica do Date Picker
+    var showDatePicker by remember { mutableStateOf(false) }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -882,53 +919,82 @@ fun TransferenciaScreen(viewModel: MovimentacaoViewModel, onNavigateBack: () -> 
             )
         }
     ) { innerPadding ->
-        LazyColumn(
+        Column(
             modifier = Modifier.padding(innerPadding).padding(16.dp).fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            item {
-                OutlinedTextField(value = data, onValueChange = { data = it }, label = { Text("Data") }, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = descricao, onValueChange = { descricao = it }, label = { Text("Descrição (Opcional)") }, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = valor, onValueChange = { valor = it }, label = { Text("Valor (Ex: 250,50)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(16.dp))
-                AutoCompleteTextField(value = contaOrigem, onValueChange = { contaOrigem = it }, label = "Conta de Origem", suggestions = contasSugeridas)
-                Spacer(Modifier.height(8.dp))
-                AutoCompleteTextField(value = contaDestino, onValueChange = { contaDestino = it }, label = "Conta de Destino", suggestions = contasSugeridas)
-                Spacer(Modifier.height(24.dp))
-                if (errorMessage != null) {
-                    Text(errorMessage!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 8.dp))
-                }
-                Button(
-                    onClick = {
-                        isLoading = true
-                        errorMessage = null
-                        viewModel.addTransferencia(data, descricao, valor, contaOrigem, contaDestino,
-                            onSuccess = {
-                                coroutineScope.launch {
-                                    viewModel.sync()
-                                    onNavigateBack()
-                                }
-                            },
-                            onError = { errorMsg ->
-                                errorMessage = errorMsg
-                                isLoading = false
-                            }
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(), enabled = !isLoading
-                ) {
-                    if (isLoading) {
-                        CircularProgressIndicator(Modifier.size(24.dp), Color.White)
-                    } else {
-                        Text("Realizar Transferência")
-                    }
+            // Campo de Data com DatePicker
+            Box {
+                OutlinedTextField(
+                    value = data,
+                    onValueChange = {},
+                    label = { Text("Data") },
+                    readOnly = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = { Icon(Icons.Default.CalendarToday, "Calendário") }
+                )
+                Box(modifier = Modifier.matchParentSize().clickable { showDatePicker = true })
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(value = descricao, onValueChange = { descricao = it }, label = { Text("Descrição (Opcional)") }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(value = valor, onValueChange = { valor = it }, label = { Text("Valor (Ex: 250,50)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(16.dp))
+            AutoCompleteTextField(value = contaOrigem, onValueChange = { contaOrigem = it }, label = "Conta de Origem", suggestions = contasSugeridas)
+            Spacer(Modifier.height(8.dp))
+            AutoCompleteTextField(value = contaDestino, onValueChange = { contaDestino = it }, label = "Conta de Destino", suggestions = contasSugeridas)
+            Spacer(Modifier.height(24.dp))
+            if (errorMessage != null) {
+                Text(errorMessage!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 8.dp))
+            }
+            Button(
+                onClick = {
+                    isLoading = true
+                    errorMessage = null
+                    // A chamada para o ViewModel permanece a mesma
+                    viewModel.addTransferencia(data, descricao, valor, contaOrigem, contaDestino,
+                        onSuccess = {
+                            // SUCESSO! Apenas navega de volta. A UI se atualizará sozinha.
+                            // Não precisa mais de coroutineScope ou chamada de sync() aqui.
+                            onNavigateBack()
+                        },
+                        onError = { errorMsg ->
+                            errorMessage = errorMsg
+                            isLoading = false
+                        }
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(), enabled = !isLoading
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(Modifier.size(24.dp), Color.White)
+                } else {
+                    Text("Realizar Transferência")
                 }
             }
         }
     }
+
+    if (showDatePicker) {
+        val datePickerState = rememberDatePickerState()
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                Button(onClick = {
+                    datePickerState.selectedDateMillis?.let { millis ->
+                        data = millis.toFormattedDateString()
+                    }
+                    showDatePicker = false
+                }) { Text("OK") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDatePicker = false }) { Text("Cancelar") }
+            }
+        ) {
+            DatePicker(state = datePickerState)
+        }
+    }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
