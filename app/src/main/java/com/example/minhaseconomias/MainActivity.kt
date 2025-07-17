@@ -20,20 +20,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -54,7 +51,9 @@ import retrofit2.http.*
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.TimeZone
 
+//region Data & API Classes (Sem Alterações)
 sealed class SyncResult {
     object Success : SyncResult()
     data class Error(val message: String) : SyncResult()
@@ -69,7 +68,9 @@ sealed class AppScreen(val route: String) {
         }
     }
     object Transferencia : AppScreen("transferencia")
+    object Filter : AppScreen("filter")
 }
+
 
 data class MovimentacaoApiDto(@SerializedName("id") val id: Int, @SerializedName("data_ocorrencia") val dataOcorrencia: String, @SerializedName("descricao") val descricao: String, @SerializedName("valor") val valor: Double, @SerializedName("categoria") val categoria: String, @SerializedName("conta") val conta: String)
 data class MovimentacoesResponse(@SerializedName("movimentacoes") val movimentacoes: List<MovimentacaoApiDto>)
@@ -137,9 +138,9 @@ class MovimentacaoRepository(
                 }
             }
         }
-        
+
         return try {
-            val serverResponse = api.getMovimentacoes(null)
+            val serverResponse = api.getMovimentacoes(null, null, null, null, null)
             if (serverResponse.isSuccessful) {
                 val serverMovs = serverResponse.body()?.movimentacoes ?: emptyList()
                 Log.d("Repository", "Recebidas ${serverMovs.size} transações do servidor. Substituindo dados locais.")
@@ -153,8 +154,6 @@ class MovimentacaoRepository(
                     contaDao.insertAll(contasUnicas.map { ContaSugerida(nome = it) })
                 }
                 Log.d("Repository", "Sincronização destrutiva concluída com sucesso.")
-
-                // CORREÇÃO: Esta deve ser a última linha do bloco 'if' para que ele retorne o tipo correto
                 SyncResult.Success
             } else {
                 Log.e("Repository", "Erro na resposta do servidor: ${serverResponse.code()}")
@@ -166,21 +165,92 @@ class MovimentacaoRepository(
         }
     }
 }
+//endregion
 
 class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : ViewModel() {
-    val movimentacoes: StateFlow<List<Movimentacao>> = repository.todasMovimentacoes.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val movimentacoes: Flow<List<Movimentacao>> = repository.todasMovimentacoes
     private val _saldosData = mutableStateOf<SaldosResponse?>(null)
     val saldosData: State<SaldosResponse?> = _saldosData
+
+    private val _searchDescricao = MutableStateFlow("")
+    val searchDescricao: StateFlow<String> = _searchDescricao
+
+    private val _startDate = MutableStateFlow("")
+    val startDate: StateFlow<String> = _startDate
+
+    private val _endDate = MutableStateFlow("")
+    val endDate: StateFlow<String> = _endDate
+
+    private val _selectedCategory = MutableStateFlow("")
+    val selectedCategory: StateFlow<String> = _selectedCategory
+
+    private val _selectedAccount = MutableStateFlow("")
+    val selectedAccount: StateFlow<String> = _selectedAccount
+
 
     val categoriasSugeridas: StateFlow<List<String>> = repository.todasCategorias.map { list -> list.map { it.nome } }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val contasSugeridas: StateFlow<List<String>> = repository.todasContas.map { list -> list.map { it.nome } }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    init {}
+    private data class FilterParams(val desc: String, val start: String, val end: String, val cat: String, val acc: String)
 
-    fun addOrUpdateMovimentacao(mov: Movimentacao) = viewModelScope.launch {
-        repository.addOrUpdateMovimentacao(mov)
+    private val allFilters = combine(
+        _searchDescricao,
+        _startDate,
+        _endDate,
+        _selectedCategory,
+        _selectedAccount
+    ) { desc, start, end, cat, acc ->
+        FilterParams(desc, start, end, cat, acc)
     }
 
+    val filteredMovimentacoes: StateFlow<List<Movimentacao>> = allFilters.combine(movimentacoes) { params, movs ->
+        movs.filter { mov ->
+            val matchesDesc = if (params.desc.isBlank()) true else mov.descricao.contains(params.desc, ignoreCase = true)
+            val matchesStartDate = if (params.start.isBlank()) true else mov.dataOcorrencia >= params.start
+            val matchesEndDate = if (params.end.isBlank()) true else mov.dataOcorrencia <= params.end
+            val matchesCategory = if (params.cat.isBlank()) true else mov.categoria == params.cat
+            val matchesAccount = if (params.acc.isBlank()) true else mov.conta == params.acc
+            matchesDesc && matchesStartDate && matchesEndDate && matchesCategory && matchesAccount
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // --- NOVO BLOCO ---
+    // Este bloco será executado quando o ViewModel for criado pela primeira vez.
+    init {
+        setDefaultDateFilters()
+    }
+
+    // --- NOVA FUNÇÃO ---
+    // Define os filtros de data para o primeiro e último dia do mês corrente.
+    private fun setDefaultDateFilters() {
+        val calendar = Calendar.getInstance()
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+
+        // Define a data para o primeiro dia do mês corrente
+        calendar.set(Calendar.DAY_OF_MONTH, 1)
+        _startDate.value = dateFormat.format(calendar.time)
+
+        // Define a data para o último dia do mês corrente
+        calendar.set(Calendar.DAY_OF_MONTH, calendar.getActualMaximum(Calendar.DAY_OF_MONTH))
+        _endDate.value = dateFormat.format(calendar.time)
+    }
+
+    fun setSearchDescricao(descricao: String) { _searchDescricao.value = descricao }
+    fun setStartDate(date: String) { _startDate.value = date }
+    fun setEndDate(date: String) { _endDate.value = date }
+    fun setSelectedCategory(category: String) { _selectedCategory.value = category }
+    fun setSelectedAccount(account: String) { _selectedAccount.value = account }
+
+    fun clearFilters() {
+        _searchDescricao.value = ""
+        _startDate.value = ""
+        _endDate.value = ""
+        _selectedCategory.value = ""
+        _selectedAccount.value = ""
+    }
+
+
+    fun addOrUpdateMovimentacao(mov: Movimentacao) = viewModelScope.launch { repository.addOrUpdateMovimentacao(mov) }
     fun addTransferencia(data: String, descricao: String, valor: String, origem: String, destino: String, onSuccess: () -> Unit, onError: (String) -> Unit) = viewModelScope.launch {
         try {
             if (origem.isBlank() || destino.isBlank() || valor.isBlank() || data.isBlank()) {
@@ -200,10 +270,7 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
             Log.e("ViewModel", "Exceção ao enviar transferência", e); onError("Falha na conexão ao tentar enviar a transferência.")
         }
     }
-
-    fun deleteMovimentacao(mov: Movimentacao) = viewModelScope.launch {
-        repository.deleteMovimentacao(mov)
-    }
+    fun deleteMovimentacao(mov: Movimentacao) = viewModelScope.launch { repository.deleteMovimentacao(mov) }
 
     suspend fun sync(): SyncResult {
         val result = repository.syncWithServer()
@@ -213,7 +280,6 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
         return result
     }
 
-    // CORREÇÃO: A função agora é pública (sem a palavra-chave 'private')
     fun fetchSaldos() = viewModelScope.launch {
         try {
             val response = repository.fetchSaldosDoServidor()
@@ -226,6 +292,7 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
     }
 }
 
+//region Outras Classes e Componíveis (Sem Alterações)
 class MovimentacaoViewModelFactory(private val repository: MovimentacaoRepository) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(MovimentacaoViewModel::class.java)) {
@@ -238,14 +305,12 @@ class MovimentacaoViewModelFactory(private val repository: MovimentacaoRepositor
 
 interface ApiService {
     @FormUrlEncoded @POST("/login") suspend fun login(@Field("email") email: String, @Field("password") password: String): Response<Unit>
-    @GET("/api/movimentacoes") suspend fun getMovimentacoes(@Query("search_descricao") searchQuery: String?): Response<MovimentacoesResponse>
+    @GET("/api/movimentacoes") suspend fun getMovimentacoes( @Query("search_descricao") searchDescricao: String?, @Query("start_date") startDate: String?, @Query("end_date") endDate: String?, @Query("category") category: String?, @Query("account") account: String?): Response<MovimentacoesResponse>
     @GET("/api/saldos") suspend fun getSaldos(): Response<SaldosResponse>
     @FormUrlEncoded @POST("/movimentacoes") suspend fun addMovimentacao(@Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("categoria") categoria: String, @Field("conta") conta: String, @Field("consolidado") consolidado: String = "on"): Response<Unit>
     @FormUrlEncoded @POST("/movimentacoes/update/{id}") suspend fun updateMovimentacao(@Path("id") id: Int, @Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("categoria") categoria: String, @Field("conta") conta: String, @Field("consolidado") consolidado: String = "on"): Response<Unit>
     @DELETE("/movimentacoes/{id}") suspend fun deleteMovimentacao(@Path("id") id: Int): Response<Unit>
-    @FormUrlEncoded
-    @POST("/movimentacoes/transferencia")
-    suspend fun addTransferencia(@Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("conta_origem") contaOrigem: String, @Field("conta_destino") contaDestino: String): Response<Unit>
+    @FormUrlEncoded @POST("/movimentacoes/transferencia") suspend fun addTransferencia(@Field("data_ocorrencia") dataOcorrencia: String, @Field("descricao") descricao: String, @Field("valor") valor: String, @Field("conta_origem") contaOrigem: String, @Field("conta_destino") contaDestino: String): Response<Unit>
 }
 
 object ApiClient {
@@ -294,11 +359,15 @@ class MainActivity : ComponentActivity() {
 fun MinhasEconomiasApp(viewModelFactory: MovimentacaoViewModelFactory) {
     val navController = rememberNavController()
     val viewModel: MovimentacaoViewModel = viewModel(factory = viewModelFactory)
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.Dashboard) }
+
 
     NavHost(navController = navController, startDestination = AppScreen.Home.route) {
         composable(AppScreen.Home.route) {
             MainScreen(
                 viewModel = viewModel,
+                currentScreen = currentScreen,
+                onScreenChange = { newScreen -> currentScreen = newScreen },
                 onNavigateToAddTransaction = { type ->
                     navController.navigate(AppScreen.TransactionDetail.createRoute(-1, type))
                 },
@@ -307,6 +376,9 @@ fun MinhasEconomiasApp(viewModelFactory: MovimentacaoViewModelFactory) {
                 },
                 onNavigateToTransfer = {
                     navController.navigate(AppScreen.Transferencia.route)
+                },
+                onNavigateToFilter = {
+                    navController.navigate(AppScreen.Filter.route)
                 }
             )
         }
@@ -332,25 +404,35 @@ fun MinhasEconomiasApp(viewModelFactory: MovimentacaoViewModelFactory) {
                 onNavigateBack = { navController.popBackStack() }
             )
         }
+        composable(AppScreen.Filter.route) {
+            FilterScreen(
+                viewModel = viewModel,
+                onNavigateBack = { navController.popBackStack() },
+                onApplyFilters = {
+                    currentScreen = Screen.Transactions
+                    navController.popBackStack()
+                }
+            )
+        }
     }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
     viewModel: MovimentacaoViewModel,
+    currentScreen: Screen,
+    onScreenChange: (Screen) -> Unit,
     onNavigateToAddTransaction: (type: String) -> Unit,
     onNavigateToEditTransaction: (Int) -> Unit,
-    onNavigateToTransfer: () -> Unit
+    onNavigateToTransfer: () -> Unit,
+    onNavigateToFilter: () -> Unit
 ) {
-    // CORREÇÃO: A variável 'isSyncing' agora é um estado local desta tela.
     var isSyncing by remember { mutableStateOf(false) }
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.Dashboard) }
-
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    // Este LaunchedEffect agora só busca os saldos na primeira vez que a tela é carregada
     LaunchedEffect(Unit) {
         viewModel.fetchSaldos()
     }
@@ -362,13 +444,11 @@ fun MainScreen(
                 title = { Text(currentScreen.label) },
                 actions = {
                     IconButton(
-                        // CORREÇÃO: A lógica de clique agora gerencia o estado 'isSyncing'
                         onClick = {
                             scope.launch {
-                                isSyncing = true // Ativa o indicador de progresso
-                                val result = viewModel.sync() // Chama a sincronização
-                                isSyncing = false // Desativa o indicador de progresso
-
+                                isSyncing = true
+                                val result = viewModel.sync()
+                                isSyncing = false
                                 val message = when (result) {
                                     is SyncResult.Success -> "Sincronização concluída com sucesso!"
                                     is SyncResult.Error -> "Falha na sincronização: ${result.message}"
@@ -376,7 +456,7 @@ fun MainScreen(
                                 snackbarHostState.showSnackbar(message)
                             }
                         },
-                        enabled = !isSyncing // O botão é desativado enquanto isSyncing for true
+                        enabled = !isSyncing
                     ) {
                         if (isSyncing) {
                             CircularProgressIndicator(Modifier.size(24.dp))
@@ -392,7 +472,7 @@ fun MainScreen(
                 listOf(Screen.Dashboard, Screen.Transactions).forEach { screen ->
                     NavigationBarItem(
                         selected = currentScreen.route == screen.route,
-                        onClick = { currentScreen = screen },
+                        onClick = { onScreenChange(screen) },
                         icon = { Icon(screen.icon, screen.label) },
                         label = { Text(screen.label) }
                     )
@@ -403,13 +483,14 @@ fun MainScreen(
             MultiActionFloatingActionButton(
                 onExpenseClick = { onNavigateToAddTransaction("despesa") },
                 onIncomeClick = { onNavigateToAddTransaction("receita") },
-                onTransferClick = onNavigateToTransfer
+                onTransferClick = onNavigateToTransfer,
+                onFilterClick = onNavigateToFilter
             )
         }
     ) { innerPadding ->
         Box(modifier = Modifier.padding(innerPadding)) {
             when (currentScreen) {
-                is Screen.Dashboard -> DashboardScreen(viewModel) { currentScreen = Screen.Transactions }
+                is Screen.Dashboard -> DashboardScreen(viewModel) { onScreenChange(Screen.Transactions) }
                 is Screen.Transactions -> TransactionsScreen(
                     viewModel = viewModel,
                     onEditClick = { mov -> onNavigateToEditTransaction(mov.localId) }
@@ -418,6 +499,7 @@ fun MainScreen(
         }
     }
 }
+
 
 @Composable
 fun LoginScreen(initialUrl: String, onLoginSuccess: (newUrl: String) -> Unit) {
@@ -521,19 +603,20 @@ fun SaldoContaItem(conta: ContaSaldo) {
 
 @Composable
 fun TransactionsScreen(viewModel: MovimentacaoViewModel, onEditClick: (Movimentacao) -> Unit) {
-    val movimentacoes by viewModel.movimentacoes.collectAsState()
-    var searchQuery by remember { mutableStateOf("") }
-    val filteredMovimentacoes = remember(searchQuery, movimentacoes) {
-        if (searchQuery.isBlank()) {
-            movimentacoes
-        } else {
-            movimentacoes.filter { it.descricao.contains(searchQuery, ignoreCase = true) }
+    val movimentacoes by viewModel.filteredMovimentacoes.collectAsState()
+
+    if (movimentacoes.isEmpty()){
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center){
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(Icons.Default.SearchOff, contentDescription = "Sem resultados", modifier = Modifier.size(64.dp), tint = Color.Gray)
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("Nenhuma transação encontrada.", style = MaterialTheme.typography.bodyLarge, color = Color.Gray)
+                Text("Tente ajustar seus filtros.", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+            }
         }
-    }
-    Column(Modifier.padding(horizontal = 8.dp)) {
-        OutlinedTextField(value = searchQuery, onValueChange = { searchQuery = it }, label = { Text("Buscar por descrição...") }, leadingIcon = { Icon(Icons.Filled.Search, "Ícone de busca") }, modifier = Modifier.fillMaxWidth().padding(8.dp))
-        LazyColumn {
-            items(filteredMovimentacoes, key = { it.localId }) { mov ->
+    } else {
+        LazyColumn(modifier = Modifier.padding(horizontal = 8.dp)) {
+            items(movimentacoes, key = { it.localId }) { mov ->
                 TransactionItem(mov, onEditClick = { onEditClick(mov) }, onDeleteClick = { viewModel.deleteMovimentacao(mov) })
             }
         }
@@ -565,13 +648,14 @@ fun TransactionItem(mov: Movimentacao, onEditClick: (Movimentacao) -> Unit, onDe
     }
 }
 
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TransactionDetailScreen(viewModel: MovimentacaoViewModel, transactionId: Int, transactionType: String?, onNavigateBack: () -> Unit) {
     val isEditMode = transactionId != -1
     val movimentacaoToEdit by produceState<Movimentacao?>(initialValue = null, key1 = transactionId) {
         if (isEditMode) {
-            value = viewModel.movimentacoes.value.find { it.localId == transactionId }
+            value = viewModel.movimentacoes.first().find { it.localId == transactionId }
         }
     }
     Scaffold(
@@ -654,6 +738,64 @@ fun TransactionSheetContent(modifier: Modifier = Modifier, viewModel: Movimentac
     }
 }
 
+@Composable
+fun MultiActionFloatingActionButton(
+    onExpenseClick: () -> Unit,
+    onIncomeClick: () -> Unit,
+    onTransferClick: () -> Unit,
+    onFilterClick: () -> Unit
+) {
+    var isExpanded by remember { mutableStateOf(false) }
+    Column(
+        horizontalAlignment = Alignment.End,
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        AnimatedVisibility(visible = isExpanded) {
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                SmallFloatingActionButton(
+                    onClick = { onFilterClick(); isExpanded = false },
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                ) { Icon(Icons.Default.FilterAlt, contentDescription = "Filtrar") }
+
+                SmallFloatingActionButton(
+                    onClick = { onTransferClick(); isExpanded = false },
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                ) { Icon(Icons.AutoMirrored.Filled.CompareArrows, contentDescription = "Transferência") }
+
+                SmallFloatingActionButton(
+                    onClick = { onIncomeClick(); isExpanded = false },
+                    containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                ) { Icon(Icons.Filled.Add, contentDescription = "Receita") }
+
+                SmallFloatingActionButton(
+                    onClick = { onExpenseClick(); isExpanded = false },
+                    containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                ) { Icon(Icons.Filled.Remove, contentDescription = "Despesa") }
+            }
+        }
+        FloatingActionButton(onClick = { isExpanded = !isExpanded }) {
+            Icon(if (isExpanded) Icons.Filled.Close else Icons.Filled.Add, contentDescription = if (isExpanded) "Fechar menu" else "Abrir menu")
+        }
+    }
+}
+
+fun formatCurrency(value: Double): String {
+    return NumberFormat.getCurrencyInstance(Locale("pt", "BR")).format(value)
+}
+
+sealed class Screen(val route: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
+    object Dashboard : Screen("dashboard", "Dashboard", Icons.Filled.Dashboard)
+    object Transactions : Screen("transactions", "Transações", Icons.Filled.SwapHoriz)
+}
+
+@Composable
+fun AutoCompleteTextField(value: String, onValueChange: (String) -> Unit, label: String, suggestions: List<String>, modifier: Modifier = Modifier) {
+    var expanded by remember { mutableStateOf(false) }; val filteredSuggestions = remember(value, suggestions) { if (value.isBlank()) { suggestions } else { suggestions.filter { it.contains(value, ignoreCase = true) } } }; Box(modifier = modifier) { OutlinedTextField(value = value, onValueChange = { onValueChange(it); expanded = true }, label = { Text(label) }, modifier = Modifier.fillMaxWidth()); DropdownMenu(expanded = expanded && filteredSuggestions.isNotEmpty(), onDismissRequest = { expanded = false }, modifier = Modifier.fillMaxWidth()) { filteredSuggestions.forEach { suggestion -> DropdownMenuItem(text = { Text(suggestion) }, onClick = { onValueChange(suggestion); expanded = false }) } } }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TransferenciaScreen(viewModel: MovimentacaoViewModel, onNavigateBack: () -> Unit) {
@@ -726,39 +868,166 @@ fun TransferenciaScreen(viewModel: MovimentacaoViewModel, onNavigateBack: () -> 
     }
 }
 
+// NOVA TELA DE FILTRO COM DATE PICKER
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MultiActionFloatingActionButton(onExpenseClick: () -> Unit, onIncomeClick: () -> Unit, onTransferClick: () -> Unit) {
-    var isExpanded by remember { mutableStateOf(false) }
-    Column(
-        horizontalAlignment = Alignment.End,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        AnimatedVisibility(visible = isExpanded) {
-            Column(
-                horizontalAlignment = Alignment.End,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+fun FilterScreen(
+    viewModel: MovimentacaoViewModel,
+    onNavigateBack: () -> Unit,
+    onApplyFilters: () -> Unit
+) {
+    val descricao by viewModel.searchDescricao.collectAsState()
+    val startDate by viewModel.startDate.collectAsState()
+    val endDate by viewModel.endDate.collectAsState()
+    val categoria by viewModel.selectedCategory.collectAsState()
+    val conta by viewModel.selectedAccount.collectAsState()
+
+    var tempDescricao by remember { mutableStateOf(descricao) }
+    var tempStartDate by remember { mutableStateOf(startDate) }
+    var tempEndDate by remember { mutableStateOf(endDate) }
+    var tempCategoria by remember { mutableStateOf(categoria) }
+    var tempConta by remember { mutableStateOf(conta) }
+
+    val categoriasSugeridas by viewModel.categoriasSugeridas.collectAsState()
+    val contasSugeridas by viewModel.contasSugeridas.collectAsState()
+
+    // Estados para controlar a exibição dos DatePickers
+    var showStartDatePicker by remember { mutableStateOf(false) }
+    var showEndDatePicker by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Filtrar Transações") },
+                navigationIcon = {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Voltar")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .padding(16.dp)
+                .fillMaxSize()
+        ) {
+            OutlinedTextField(value = tempDescricao, onValueChange = { tempDescricao = it }, label = { Text("Descrição") }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+
+            // Campo de Data de Início com DatePicker
+            Box {
+                OutlinedTextField(
+                    value = tempStartDate,
+                    onValueChange = {},
+                    label = { Text("Data Início") },
+                    readOnly = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = { Icon(Icons.Default.CalendarToday, "Calendário") }
+                )
+                Box(modifier = Modifier.matchParentSize().clickable { showStartDatePicker = true })
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // Campo de Data de Fim com DatePicker
+            Box {
+                OutlinedTextField(
+                    value = tempEndDate,
+                    onValueChange = {},
+                    label = { Text("Data Fim") },
+                    readOnly = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = { Icon(Icons.Default.CalendarToday, "Calendário") }
+                )
+                Box(modifier = Modifier.matchParentSize().clickable { showEndDatePicker = true })
+            }
+
+
+            Spacer(Modifier.height(8.dp))
+            AutoCompleteTextField(value = tempCategoria, onValueChange = { tempCategoria = it }, label = "Categoria", suggestions = categoriasSugeridas)
+            Spacer(Modifier.height(8.dp))
+            AutoCompleteTextField(value = tempConta, onValueChange = { tempConta = it }, label = "Conta", suggestions = contasSugeridas)
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = {
+                    viewModel.setSearchDescricao(tempDescricao)
+                    viewModel.setStartDate(tempStartDate)
+                    viewModel.setEndDate(tempEndDate)
+                    viewModel.setSelectedCategory(tempCategoria)
+                    viewModel.setSelectedAccount(tempConta)
+                    onApplyFilters()
+                },
+                modifier = Modifier.fillMaxWidth()
             ) {
-                SmallFloatingActionButton(onClick = { onTransferClick(); isExpanded = false }, containerColor = MaterialTheme.colorScheme.secondaryContainer) { Icon(Icons.AutoMirrored.Filled.CompareArrows, contentDescription = "Transferência") }
-                SmallFloatingActionButton(onClick = { onIncomeClick(); isExpanded = false }, containerColor = MaterialTheme.colorScheme.tertiaryContainer) { Icon(Icons.Filled.Add, contentDescription = "Receita") }
-                SmallFloatingActionButton(onClick = { onExpenseClick(); isExpanded = false }, containerColor = MaterialTheme.colorScheme.tertiaryContainer) { Icon(Icons.Filled.Remove, contentDescription = "Despesa") }
+                Text("Filtrar")
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = {
+                    viewModel.clearFilters()
+                    tempDescricao = ""
+                    tempStartDate = ""
+                    tempEndDate = ""
+                    tempCategoria = ""
+                    tempConta = ""
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Limpar Filtros")
             }
         }
-        FloatingActionButton(onClick = { isExpanded = !isExpanded }) {
-            Icon(if (isExpanded) Icons.Filled.Close else Icons.Filled.Add, contentDescription = if (isExpanded) "Fechar menu" else "Abrir menu")
+    }
+
+    // Lógica para exibir o DatePickerDialog de Data de Início
+    if (showStartDatePicker) {
+        val datePickerState = rememberDatePickerState()
+        DatePickerDialog(
+            onDismissRequest = { showStartDatePicker = false },
+            confirmButton = {
+                Button(onClick = {
+                    datePickerState.selectedDateMillis?.let { millis ->
+                        tempStartDate = millis.toFormattedDateString()
+                    }
+                    showStartDatePicker = false
+                }) { Text("OK") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showStartDatePicker = false }) { Text("Cancelar") }
+            }
+        ) {
+            DatePicker(state = datePickerState)
+        }
+    }
+
+    // Lógica para exibir o DatePickerDialog de Data de Fim
+    if (showEndDatePicker) {
+        val datePickerState = rememberDatePickerState()
+        DatePickerDialog(
+            onDismissRequest = { showEndDatePicker = false },
+            confirmButton = {
+                Button(onClick = {
+                    datePickerState.selectedDateMillis?.let { millis ->
+                        tempEndDate = millis.toFormattedDateString()
+                    }
+                    showEndDatePicker = false
+                }) { Text("OK") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEndDatePicker = false }) { Text("Cancelar") }
+            }
+        ) {
+            DatePicker(state = datePickerState)
         }
     }
 }
 
-fun formatCurrency(value: Double): String {
-    return NumberFormat.getCurrencyInstance(Locale("pt", "BR")).format(value)
+// Função de extensão para formatar a data
+fun Long.toFormattedDateString(): String {
+    val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+    sdf.timeZone = TimeZone.getTimeZone("UTC") // Importante para evitar problemas de fuso horário
+    return sdf.format(Date(this))
 }
 
-sealed class Screen(val route: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    object Dashboard : Screen("dashboard", "Dashboard", Icons.Filled.Dashboard)
-    object Transactions : Screen("transactions", "Transações", Icons.Filled.SwapHoriz)
-}
-
-@Composable
-fun AutoCompleteTextField(value: String, onValueChange: (String) -> Unit, label: String, suggestions: List<String>, modifier: Modifier = Modifier) {
-    var expanded by remember { mutableStateOf(false) }; val filteredSuggestions = remember(value, suggestions) { if (value.isBlank()) { suggestions } else { suggestions.filter { it.contains(value, ignoreCase = true) } } }; Box(modifier = modifier) { OutlinedTextField(value = value, onValueChange = { onValueChange(it); expanded = true }, label = { Text(label) }, modifier = Modifier.fillMaxWidth()); DropdownMenu(expanded = expanded && filteredSuggestions.isNotEmpty(), onDismissRequest = { expanded = false }, modifier = Modifier.fillMaxWidth()) { filteredSuggestions.forEach { suggestion -> DropdownMenuItem(text = { Text(suggestion) }, onClick = { onValueChange(suggestion); expanded = false }) } } }
-}
+//endregion
