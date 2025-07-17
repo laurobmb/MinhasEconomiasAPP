@@ -6,7 +6,7 @@
       <sub><b>Tela de Login</b></sub>
     </td>
     <td align="center">
-      <img src="minhas_economias_app-4.jpg" alt="Dashboard" width="200"/>
+      <img src="minhas_economias_app-4.png" alt="Dashboard" width="200"/>
       <br />
       <sub><b>Dashboard</b></sub>
     </td>
@@ -28,7 +28,7 @@
       <sub><b>Nova Transferência</b></sub>
     </td>
     <td align="center">
-      <img src="minhas_economias_app-5.jpg" alt="Menu de Ações" width="200"/>
+      <img src="minhas_economias_app-5.png" alt="Menu de Ações" width="200"/>
       <br />
       <sub><b>Menu de Ações</b></sub>
     </td>
