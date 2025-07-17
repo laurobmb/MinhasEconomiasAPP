@@ -213,24 +213,18 @@ class MovimentacaoViewModel(private val repository: MovimentacaoRepository) : Vi
             matchesDesc && matchesStartDate && matchesEndDate && matchesCategory && matchesAccount
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    // --- NOVO BLOCO ---
-    // Este bloco será executado quando o ViewModel for criado pela primeira vez.
+    
     init {
         setDefaultDateFilters()
     }
-
-    // --- NOVA FUNÇÃO ---
-    // Define os filtros de data para o primeiro e último dia do mês corrente.
+    
     private fun setDefaultDateFilters() {
         val calendar = Calendar.getInstance()
         val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
 
-        // Define a data para o primeiro dia do mês corrente
         calendar.set(Calendar.DAY_OF_MONTH, 1)
         _startDate.value = dateFormat.format(calendar.time)
 
-        // Define a data para o último dia do mês corrente
         calendar.set(Calendar.DAY_OF_MONTH, calendar.getActualMaximum(Calendar.DAY_OF_MONTH))
         _endDate.value = dateFormat.format(calendar.time)
     }
@@ -682,8 +676,24 @@ fun TransactionDetailScreen(viewModel: MovimentacaoViewModel, transactionId: Int
     }
 }
 
+// CORREÇÃO AQUI: Adicionado campo de data e lógica do DatePicker
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TransactionSheetContent(modifier: Modifier = Modifier, viewModel: MovimentacaoViewModel, movimentacaoToEdit: Movimentacao?, initialTransactionType: String?, onSuccess: () -> Unit) {
+fun TransactionSheetContent(
+    modifier: Modifier = Modifier,
+    viewModel: MovimentacaoViewModel,
+    movimentacaoToEdit: Movimentacao?,
+    initialTransactionType: String?,
+    onSuccess: () -> Unit
+) {
+    // Estados dos campos do formulário
+    var dataOcorrencia by remember(movimentacaoToEdit) {
+        mutableStateOf(
+            movimentacaoToEdit?.dataOcorrencia ?: SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        )
+    }
+    var showDatePicker by remember { mutableStateOf(false) }
+
     var descricao by remember(movimentacaoToEdit) { mutableStateOf(movimentacaoToEdit?.descricao ?: "") }
     var valor by remember(movimentacaoToEdit) { mutableStateOf(if (movimentacaoToEdit != null) kotlin.math.abs(movimentacaoToEdit.valor).toString().replace('.', ',') else "") }
     var categoria by remember(movimentacaoToEdit) { mutableStateOf(movimentacaoToEdit?.categoria ?: "") }
@@ -697,16 +707,33 @@ fun TransactionSheetContent(modifier: Modifier = Modifier, viewModel: Movimentac
             }
         )
     }
+
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+
     val categoriasSugeridas by viewModel.categoriasSugeridas.collectAsState()
     val contasSugeridas by viewModel.contasSugeridas.collectAsState()
+
     LazyColumn(
         modifier = modifier.padding(16.dp).fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         item {
             Column {
+                // NOVO CAMPO DE DATA
+                Box {
+                    OutlinedTextField(
+                        value = dataOcorrencia,
+                        onValueChange = {},
+                        label = { Text("Data da Ocorrência") },
+                        readOnly = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        trailingIcon = { Icon(Icons.Default.CalendarToday, "Calendário") }
+                    )
+                    Box(modifier = Modifier.matchParentSize().clickable { showDatePicker = true })
+                }
+                Spacer(Modifier.height(8.dp))
+
                 OutlinedTextField(value = descricao, onValueChange = { descricao = it }, label = { Text("Descrição") }, modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = valor, onValueChange = { valor = it }, label = { Text("Valor (Ex: 150,75)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -728,12 +755,47 @@ fun TransactionSheetContent(modifier: Modifier = Modifier, viewModel: Movimentac
                         isLoading = true; errorMessage = null; val valorNumerico = valor.replace(",", ".").toDoubleOrNull()
                         if (valorNumerico == null) { errorMessage = "Valor inválido."; isLoading = false; return@Button }
                         val valorFinal = if (isDespesa) -kotlin.math.abs(valorNumerico) else kotlin.math.abs(valorNumerico)
-                        val mov = movimentacaoToEdit?.copy(descricao = descricao, valor = valorFinal, categoria = categoria, conta = conta) ?: Movimentacao(serverId = null, dataOcorrencia = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()), descricao = descricao, valor = valorFinal, categoria = categoria, conta = conta)
+                        // Lógica de salvar agora inclui o campo de data do estado
+                        val mov = movimentacaoToEdit?.copy(
+                            dataOcorrencia = dataOcorrencia,
+                            descricao = descricao,
+                            valor = valorFinal,
+                            categoria = categoria,
+                            conta = conta
+                        ) ?: Movimentacao(
+                            serverId = null,
+                            dataOcorrencia = dataOcorrencia,
+                            descricao = descricao,
+                            valor = valorFinal,
+                            categoria = categoria,
+                            conta = conta
+                        )
                         viewModel.addOrUpdateMovimentacao(mov); onSuccess()
                     },
                     modifier = Modifier.fillMaxWidth(), enabled = !isLoading
                 ) { if (isLoading) { CircularProgressIndicator(Modifier.size(24.dp), Color.White) } else { Text("Salvar") } }
             }
+        }
+    }
+
+    // Lógica para exibir o DatePickerDialog
+    if (showDatePicker) {
+        val datePickerState = rememberDatePickerState()
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                Button(onClick = {
+                    datePickerState.selectedDateMillis?.let { millis ->
+                        dataOcorrencia = millis.toFormattedDateString()
+                    }
+                    showDatePicker = false
+                }) { Text("OK") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDatePicker = false }) { Text("Cancelar") }
+            }
+        ) {
+            DatePicker(state = datePickerState)
         }
     }
 }
@@ -868,7 +930,6 @@ fun TransferenciaScreen(viewModel: MovimentacaoViewModel, onNavigateBack: () -> 
     }
 }
 
-// NOVA TELA DE FILTRO COM DATE PICKER
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FilterScreen(
@@ -891,7 +952,6 @@ fun FilterScreen(
     val categoriasSugeridas by viewModel.categoriasSugeridas.collectAsState()
     val contasSugeridas by viewModel.contasSugeridas.collectAsState()
 
-    // Estados para controlar a exibição dos DatePickers
     var showStartDatePicker by remember { mutableStateOf(false) }
     var showEndDatePicker by remember { mutableStateOf(false) }
 
@@ -913,10 +973,13 @@ fun FilterScreen(
                 .padding(16.dp)
                 .fillMaxSize()
         ) {
-            OutlinedTextField(value = tempDescricao, onValueChange = { tempDescricao = it }, label = { Text("Descrição") }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(
+                value = tempDescricao,
+                onValueChange = { tempDescricao = it },
+                label = { Text("Descrição") },
+                modifier = Modifier.fillMaxWidth()
+            )
             Spacer(Modifier.height(8.dp))
-
-            // Campo de Data de Início com DatePicker
             Box {
                 OutlinedTextField(
                     value = tempStartDate,
@@ -928,10 +991,7 @@ fun FilterScreen(
                 )
                 Box(modifier = Modifier.matchParentSize().clickable { showStartDatePicker = true })
             }
-
             Spacer(Modifier.height(8.dp))
-
-            // Campo de Data de Fim com DatePicker
             Box {
                 OutlinedTextField(
                     value = tempEndDate,
@@ -980,7 +1040,6 @@ fun FilterScreen(
         }
     }
 
-    // Lógica para exibir o DatePickerDialog de Data de Início
     if (showStartDatePicker) {
         val datePickerState = rememberDatePickerState()
         DatePickerDialog(
@@ -1001,7 +1060,6 @@ fun FilterScreen(
         }
     }
 
-    // Lógica para exibir o DatePickerDialog de Data de Fim
     if (showEndDatePicker) {
         val datePickerState = rememberDatePickerState()
         DatePickerDialog(
@@ -1023,10 +1081,9 @@ fun FilterScreen(
     }
 }
 
-// Função de extensão para formatar a data
 fun Long.toFormattedDateString(): String {
     val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-    sdf.timeZone = TimeZone.getTimeZone("UTC") // Importante para evitar problemas de fuso horário
+    sdf.timeZone = TimeZone.getTimeZone("UTC")
     return sdf.format(Date(this))
 }
 
