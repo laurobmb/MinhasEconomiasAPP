@@ -1,6 +1,12 @@
 # Minhas Economias - Aplicativo Android 💰
 
-Este é um aplicativo Android para gerenciamento de finanças pessoais, desenvolvido com foco em uma arquitetura moderna e na experiência do usuário. Ele permite o controle de receitas e despesas com uma abordagem *offline-first*, garantindo que o aplicativo funcione mesmo sem conexão à internet e sincronize os dados com um servidor backend quando disponível.
+# Minhas Economias – App Android de Finanças Pessoais
+
+Este é um aplicativo Android para gerenciamento de finanças pessoais, desenvolvido com foco em uma arquitetura moderna e na experiência do usuário.
+
+Ele permite o controle de receitas e despesas com uma abordagem *offline-first*, garantindo o funcionamento mesmo sem conexão à internet e a sincronização automática dos dados com um servidor backend assim que houver conectividade.
+
+> 🔗 O código-fonte do backend que dá suporte a este aplicativo está disponível em: [laurobmb/minhas_economias](https://github.com/laurobmb/minhas_economias)
 
 ## 📸 Telas do Aplicativo
 
