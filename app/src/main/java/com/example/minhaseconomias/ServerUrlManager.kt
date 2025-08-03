@@ -9,7 +9,7 @@ object ServerUrlManager {
     private const val PREFS_NAME = "MinhasEconomiasPrefs"
     private const val KEY_SERVER_URL = "server_url"
     // Este será o valor padrão, que aparecerá pré-preenchido
-    private const val DEFAULT_URL = "http://192.168.0.221:8080"
+    private const val DEFAULT_URL = "https://www.minhaseconomias.dev.br"
 
     private lateinit var prefs: SharedPreferences
 
